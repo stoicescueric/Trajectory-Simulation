@@ -639,6 +639,7 @@ async function runOptimize() {
     const r = await API('optimize', {
       goal_distance: p.goal_distance,
       launch_height: p.launch_height,
+      wind:          p.wind,
       enable_drag:   p.enable_drag,
       dv_range:      +ui.sweepDv.value,
       da_range:      +ui.sweepDa.value,

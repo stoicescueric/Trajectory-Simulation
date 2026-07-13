@@ -69,8 +69,8 @@ def api_simulate():
 def api_sweep():
     body = request.json or {}
     p  = _params(body)
-    dv = float(body.get("dv_range",   1.0))
-    da = float(body.get("da_range",   5.0))
+    dv = float(body.get("dv_range",   0.7))
+    da = float(body.get("da_range",   1.5))
     n  = int(body.get("resolution",  11))
     n  = max(3, min(21, n))
     return jsonify(make_sweep(p, dv_range=dv, da_range=da, n=n))
@@ -79,13 +79,16 @@ def api_sweep():
 @app.route("/api/optimize", methods=["POST"])
 def api_optimize():
     body     = request.json or {}
-    distance = float(body.get("goal_distance", in_to_m(60)))
-    h_launch = float(body.get("launch_height", in_to_m(15.75)))
-    drag     = bool(body.get("enable_drag",    True))
+    p        = _params(body)
+    distance = p.goal_distance
+    h_launch = p.launch_height
+    drag     = p.enable_drag
     dv_range = float(body.get("dv_range",      0.7))
     da_range = float(body.get("da_range",      1.5))
     best = find_optimal(distance, h_launch, enable_drag=drag,
-                        dv_range=dv_range, da_range=da_range)
+                        dv_range=dv_range, da_range=da_range,
+                        goal_height=p.goal_height, goal_depth=p.goal_depth,
+                        wind=p.wind)
     if best is None:
         return jsonify({"ok": False})
     return jsonify({"ok": True, "velocity": best.velocity, "angle_deg": best.angle_deg})
