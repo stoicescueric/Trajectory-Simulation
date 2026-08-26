@@ -263,132 +263,11 @@ def test_cache():
           f"size={len(P._SUR_CACHE)}")
 
 
-# ── 9. Point + arrival-angle inverse solver ─────────────────────────────────
-def test_inverse():
-    def closest(result, velocity, angle_deg):
-        solutions = result.get("solutions") or []
-        if not solutions:
-            return None
-        return min(solutions, key=lambda s:
-                   (s["velocity_ms"] - velocity) ** 2
-                   + ((s["launch_angle_deg"] - angle_deg) / 10.0) ** 2)
-
-    def direct(solution, launch_height, target_y, launch_x=0.0,
-               wind=0.0, enable_drag=True):
-        return P._integrate(
-            [solution["velocity_ms"]], [solution["launch_angle_deg"]],
-            launch_height, goal_height=target_y, wind=wind,
-            enable_drag=enable_drag, dt=0.001, launch_x=launch_x,
-            stop_at_rim=True,
-        )
-
-    # Vacuum provides an independent closed-form oracle, rather than another
-    # integration-based reference.  Arrival angle is positive downward.
-    launch_height = P.in_to_m(15.75)
-    target_x = 1.70
-    target_y = P.GOAL_TOP_HEIGHT_M
-    gamma_deg = 45.0
-    X = target_x
-    dy = target_y - launch_height
-    tan_gamma = math.tan(math.radians(gamma_deg))
-    t = math.sqrt(2.0 * (dy + X * tan_gamma) / P.G)
-    ux = X / t
-    uy = P.G * t - ux * tan_gamma
-    want_v = math.hypot(ux, uy)
-    want_a = math.degrees(math.atan2(uy, ux))
-
-    vacuum = P.solve_point_arrival(
-        target_x, target_y, gamma_deg, launch_height,
-        enable_drag=False, include_family=False, refine=True,
-    )
-    vac_best = closest(vacuum, want_v, want_a)
-    command_ok = (vac_best is not None
-                  and abs(vac_best["velocity_ms"] - want_v) < 0.01
-                  and abs(vac_best["launch_angle_deg"] - want_a) < 0.05)
-    check("inverse matches drag-off closed form", command_ok,
-          "no solution" if vac_best is None else
-          f"|Δv|={abs(vac_best['velocity_ms'] - want_v):.2e} m/s, "
-          f"|Δa|={abs(vac_best['launch_angle_deg'] - want_a):.2e}°")
-
-    if vac_best is not None:
-        r = direct(vac_best, launch_height, target_y, enable_drag=False)
-        dx = abs(float(r["x_at_top"][0]) - target_x)
-        dg = abs(float(r["entry_angle_deg"][0]) - gamma_deg)
-        check("inverse vacuum command has tight direct residuals",
-              dx < 1e-4 and dg < 0.01,
-              f"|Δx|={dx:.2e} m, |Δγ|={dg:.2e}°")
-    else:
-        check("inverse vacuum command has tight direct residuals", False, "no solution")
-
-    family = vacuum.get("family")
-    check("include_family=False omits the family payload",
-          "family" not in vacuum or family is None or len(family) == 0)
-
-    # Drag-on round trip through an arbitrary event height.  The target comes
-    # from a known command; the inverse must recover a branch near that command.
-    known_v, known_a = 6.2, 56.0
-    launch_height = 0.42
-    target_y = 0.83
-    wind = 0.35
-    truth = P._integrate(
-        [known_v], [known_a], launch_height, goal_height=target_y,
-        wind=wind, enable_drag=True, dt=0.001, stop_at_rim=True,
-    )
-    target_x = float(truth["x_at_top"][0])
-    gamma_deg = float(truth["entry_angle_deg"][0])
-    drag = P.solve_point_arrival(
-        target_x, target_y, gamma_deg, launch_height,
-        wind=wind, enable_drag=True, include_family=False, refine=True,
-    )
-    drag_best = closest(drag, known_v, known_a)
-    round_trip_ok = (drag_best is not None
-                     and abs(drag_best["velocity_ms"] - known_v) < 0.02
-                     and abs(drag_best["launch_angle_deg"] - known_a) < 0.1)
-    check("inverse drag-on round trip recovers the known command", round_trip_ok,
-          "no solution" if drag_best is None else
-          f"|Δv|={abs(drag_best['velocity_ms'] - known_v):.2e} m/s, "
-          f"|Δa|={abs(drag_best['launch_angle_deg'] - known_a):.2e}°")
-
-    if drag_best is not None:
-        r = direct(drag_best, launch_height, target_y, wind=wind)
-        dx = abs(float(r["x_at_top"][0]) - target_x)
-        dg = abs(float(r["entry_angle_deg"][0]) - gamma_deg)
-        check("inverse drag-on command has tight direct residuals",
-              dx < 1e-4 and dg < 0.01,
-              f"|Δx|={dx:.2e} m, |Δγ|={dg:.2e}°")
-    else:
-        check("inverse drag-on command has tight direct residuals", False, "no solution")
-
-    # Horizontal translation must not affect the required launch command.
-    shift = 0.37
-    shifted = P.solve_point_arrival(
-        target_x + shift, target_y, gamma_deg, launch_height,
-        launch_x=shift, wind=wind, enable_drag=True,
-        include_family=False, refine=True,
-    )
-    shifted_best = closest(shifted, known_v, known_a)
-    translation_ok = (drag_best is not None and shifted_best is not None
-                      and abs(shifted_best["velocity_ms"] - drag_best["velocity_ms"]) < 1e-8
-                      and abs(shifted_best["launch_angle_deg"]
-                              - drag_best["launch_angle_deg"]) < 1e-8)
-    check("inverse is invariant under horizontal translation", translation_ok)
-
-    invalid_raised = False
-    try:
-        P.solve_point_arrival(
-            0.0, target_y, gamma_deg, launch_height,
-            launch_x=0.0, include_family=False,
-        )
-    except ValueError:
-        invalid_raised = True
-    check("inverse rejects an event point at the launch x", invalid_raised)
-
-
-# ── 10. Timings ─────────────────────────────────────────────────────────────
+# ── Timing baselines ────────────────────────────────────────────────────────
 BASELINE = {"find_optimal": 1.621, "make_sweep": 1.055, "build_lut": 5.010, "simulate": 0.004748}
 
 
-# ── 10. Shot family is exactly the set of shots that score ──────────────────
+# ── 9. Shot family is exactly the set of shots that score ───────────────────
 def test_family():
     bad_score = bad_window = bad_entry = 0
     total = 0
@@ -432,7 +311,7 @@ def test_family():
           f"max Δmargin={worst_best:.4f}σ (1° quantisation)")
 
 
-# ── 11. Monte-Carlo cloud agrees with the analytic probability ──────────────
+# ── 10. Monte-Carlo cloud agrees with the analytic probability ──────────────
 def test_monte_carlo():
     worst_z = 0.0
     detail = ""
@@ -454,7 +333,7 @@ def test_monte_carlo():
           f"max z={worst_z:.2f} ({detail}, 600 samples)")
 
 
-# ── 12. Batch distance sweep reproduces the single-distance solver ──────────
+# ── 11. Batch distance sweep reproduces the single-distance solver ──────────
 def test_target_sweep():
     h  = P.in_to_m(15.75)
     ds = [P.in_to_m(x) for x in range(24, 145, 8)]
@@ -545,7 +424,6 @@ if __name__ == "__main__":
     test_cross_path()
     test_optimum()
     test_cache()
-    test_inverse()
     test_family()
     test_monte_carlo()
     test_target_sweep()

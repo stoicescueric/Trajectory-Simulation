@@ -7,7 +7,6 @@ Endpoints:
   POST /api/montecarlo-> N random shots drawn from the shooter's own error
   POST /api/target_sweep -> best shot at each of a chunk of distances
   POST /api/optimize  -> find optimal (v, angle)
-  POST /api/inverse   -> solve for shots through a point at an arrival angle
   POST /api/lut       -> download CSV lookup table
 """
 import csv
@@ -18,7 +17,7 @@ import os
 from flask import Flask, request, jsonify, send_from_directory, Response
 
 from physics import (
-    ShotParams, simulate, make_sweep, find_optimal, solve_point_arrival, build_lut,
+    ShotParams, simulate, make_sweep, find_optimal, build_lut,
     shot_family, monte_carlo, sweep_targets,
     in_to_m, GOAL_TOP_HEIGHT_M, GOAL_DEPTH_M,
 )
@@ -112,69 +111,6 @@ def api_optimize():
         },
         "monotone_ok":  diag["monotone_ok"],
     })
-
-
-@app.route("/api/inverse", methods=["POST"])
-def api_inverse():
-    try:
-        body = request.get_json(silent=True)
-        if not isinstance(body, dict):
-            raise ValueError("request body must be a JSON object")
-
-        required_numbers = ("target_x", "target_y", "arrival_angle_deg", "launch_height")
-        optional_numbers = {"launch_x": 0.0, "wind": 0.0}
-        numbers = {}
-
-        for name in required_numbers:
-            if name not in body:
-                raise ValueError(f"missing required field: {name}")
-            value = body[name]
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"{name} must be a finite number")
-            try:
-                value = float(value)
-            except (OverflowError, ValueError):
-                raise ValueError(f"{name} must be a finite number") from None
-            if not math.isfinite(value):
-                raise ValueError(f"{name} must be a finite number")
-            numbers[name] = value
-
-        for name, default in optional_numbers.items():
-            value = body.get(name, default)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"{name} must be a finite number")
-            try:
-                value = float(value)
-            except (OverflowError, ValueError):
-                raise ValueError(f"{name} must be a finite number") from None
-            if not math.isfinite(value):
-                raise ValueError(f"{name} must be a finite number")
-            numbers[name] = value
-
-        flags = {}
-        for name, default in (("enable_drag", True),
-                              ("include_family", True),
-                              ("refine", True)):
-            value = body.get(name, default)
-            if not isinstance(value, bool):
-                raise ValueError(f"{name} must be a boolean")
-            flags[name] = value
-
-        result = solve_point_arrival(
-            numbers["target_x"],
-            numbers["target_y"],
-            numbers["arrival_angle_deg"],
-            numbers["launch_height"],
-            launch_x=numbers["launch_x"],
-            wind=numbers["wind"],
-            enable_drag=flags["enable_drag"],
-            include_family=flags["include_family"],
-            refine=flags["refine"],
-        )
-        result.setdefault("ok", True)
-        return jsonify(result)
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
 
 
 @app.route("/api/family", methods=["POST"])
