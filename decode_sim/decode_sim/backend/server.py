@@ -83,15 +83,29 @@ def api_optimize():
     distance = p.goal_distance
     h_launch = p.launch_height
     drag     = p.enable_drag
+    # dv_range / da_range are the shooter's 1σ repeatability.
     dv_range = float(body.get("dv_range",      0.7))
     da_range = float(body.get("da_range",      1.5))
-    best = find_optimal(distance, h_launch, enable_drag=drag,
-                        dv_range=dv_range, da_range=da_range,
-                        goal_height=p.goal_height, goal_depth=p.goal_depth,
-                        wind=p.wind)
+    best, diag = find_optimal(distance, h_launch, enable_drag=drag,
+                              dv_range=dv_range, da_range=da_range,
+                              goal_height=p.goal_height, goal_depth=p.goal_depth,
+                              wind=p.wind, with_diagnostics=True)
     if best is None:
         return jsonify({"ok": False})
-    return jsonify({"ok": True, "velocity": best.velocity, "angle_deg": best.angle_deg})
+    return jsonify({
+        "ok":           True,
+        "velocity":     best.velocity,
+        "angle_deg":    best.angle_deg,
+        "margin_sigma": diag["margin_sigma"],
+        "p_make":       diag["p_make"],
+        "margins": {
+            "v_down_ms":  diag["v_down_ms"],
+            "v_up_ms":    diag["v_up_ms"],
+            "a_down_deg": diag["a_down_deg"],
+            "a_up_deg":   diag["a_up_deg"],
+        },
+        "monotone_ok":  diag["monotone_ok"],
+    })
 
 
 @app.route("/api/lut", methods=["POST"])

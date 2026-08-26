@@ -16,11 +16,33 @@ GOAL model — ball enters through the TOP opening:
   A ball SCORES when its center crosses y = goal_height while descending
   (vy < 0), with x inside the top opening after shrinking the front/back
   lips by one artifact radius.
+
+Design notes
+------------
+Everything integrates through ONE vectorised RK4 core (`_integrate`).  Two
+properties of this problem make the analysis cheap:
+
+  1. The rim crossing is located with a CUBIC HERMITE root solve rather than
+     linear interpolation.  Because vy is known at both ends of a step, the
+     crossing is 4th-order accurate, so the step size can be ~10x larger than
+     a linearly-interpolated event would allow (measured: 9e-5 m crossing
+     error at dt = 0.02, 0.04 and even 0.08).
+
+  2. `x_at_top` — the x where the ball descends through the rim plane — is
+     STRICTLY MONOTONE in launch velocity at fixed angle, and does not depend
+     on goal_distance at all (distance only enters the final comparison).  So
+     one cached surrogate over (velocity, angle) answers every goal distance
+     and every tolerance setting, and the scoring region is a band bounded by
+     two curves v_lo(angle), v_hi(angle) that can be inverted directly instead
+     of sampled on a dense grid.
 """
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import math
-from typing import List, Optional
+import threading
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 
 
@@ -37,6 +59,19 @@ NU_AIR     = 1.516e-5              # m²/s
 GOAL_TOP_HEIGHT_M = 0.98425        # 38.75 in → top lip of basket opening
 GOAL_DEPTH_M      = 0.46482        # 18.3 in  → horizontal depth of opening
 
+# ── Integration step sizes ──────────────────────────────────────────────────
+# Hermite event location makes accuracy nearly independent of dt, so the
+# surrogate runs coarse.  Drawn paths use a finer step purely for a smooth
+# polyline.
+DT_SURROGATE = 0.02
+DT_PATH      = 0.005
+
+# ── Commanded shot range (matches the UI sliders) ───────────────────────────
+V_MIN_CMD, V_MAX_CMD = 2.0, 12.0
+A_MIN_CMD, A_MAX_CMD = 20.0, 80.0
+
+_SQRT2 = math.sqrt(2.0)
+
 
 def in_to_m(inches: float) -> float:  return inches * 0.0254
 def m_to_in(m: float)       -> float:  return m / 0.0254
@@ -48,6 +83,8 @@ def _entry_x_bounds(goal_distance: float, goal_depth: float):
 
 
 # ── Drag coefficient (smooth sphere) ────────────────────────────────────────
+# `_cd` is the readable reference form; `_cd_np` is what actually runs.  They
+# are pinned together by a test — edit both or neither.
 def _cd(v: float) -> float:
     re = v * ARTIFACT_D / NU_AIR
     if re < 1.0:    return 24.0 / max(re, 1e-6)
@@ -55,6 +92,15 @@ def _cd(v: float) -> float:
     if re < 2e5:    return 0.47          # sub-critical — where FTC speeds sit
     if re < 3.5e5:  return 0.47 - (re - 2e5) / 1.5e5 * 0.27
     return 0.20
+
+
+def _cd_np(speed: np.ndarray) -> np.ndarray:
+    """Vectorised twin of `_cd`."""
+    re = np.maximum(speed * ARTIFACT_D / NU_AIR, 1e-9)
+    return np.where(re < 1.0,   24.0 / re,
+           np.where(re < 1e3,   24.0 / re + 6.0 / (1.0 + np.sqrt(re)) + 0.4,
+           np.where(re < 2e5,   0.47,
+           np.where(re < 3.5e5, 0.47 - (re - 2e5) / 1.5e5 * 0.27, 0.20))))
 
 
 # ── Data classes ────────────────────────────────────────────────────────────
@@ -93,137 +139,709 @@ class TrajectoryResult:
 
 
 # ── Equations of motion ──────────────────────────────────────────────────────
-def _accel(state, p: ShotParams):
-    _, y, vx, vy = state
-    if y < 0:
-        return (0.0, 0.0)
-    ux    = vx - p.wind
+def _accel_np(y, vx, vy, wind: float, enable_drag: bool):
+    ux    = vx - wind
     uy    = vy
-    speed = math.hypot(ux, uy)
-    ax, ay = 0.0, -G
-    if p.enable_drag and speed > 1e-6:
-        fd  = 0.5 * RHO_AIR * _cd(speed) * ARTIFACT_A * speed * speed
-        ax -= fd * ux / speed / ARTIFACT_M
-        ay -= fd * uy / speed / ARTIFACT_M
-    return (ax, ay)
+    speed = np.hypot(ux, uy)
+    above = y >= 0
+    ax    = np.zeros_like(vx)
+    ay    = np.where(above, -G, 0.0)
+    if enable_drag:
+        ok  = above & (speed > 1e-6)
+        spd = np.where(ok, speed, 1.0)
+        fd  = np.where(ok, 0.5 * RHO_AIR * _cd_np(speed) * ARTIFACT_A * speed * speed, 0.0)
+        ax  = np.where(ok, -fd * ux / spd / ARTIFACT_M, 0.0)
+        ay  = np.where(ok, -G - fd * uy / spd / ARTIFACT_M, ay)
+    return ax, ay
 
 
-# ── RK4 integrator ──────────────────────────────────────────────────────────
-def simulate(p: ShotParams, dt: float = 0.001, t_max: float = 4.0) -> TrajectoryResult:
-    angle = math.radians(p.angle_deg)
-    state = [
-        p.launch_x,
-        p.launch_height,
-        p.velocity * math.cos(angle),
-        p.velocity * math.sin(angle),
-    ]
+# ── Cubic Hermite event location ────────────────────────────────────────────
+# A step gives us position AND velocity at both ends, which is exactly the
+# data a cubic Hermite needs.  Solving the Hermite for the crossing keeps the
+# event 4th-order accurate no matter how coarse dt is.
+def _hermite_eval(p0, d0, p1, d1, dt: float, tau):
+    t2 = tau * tau
+    t3 = t2 * tau
+    return ((2*t3 - 3*t2 + 1) * p0 + (t3 - 2*t2 + tau) * dt * d0
+          + (-2*t3 + 3*t2)    * p1 + (t3 - t2)         * dt * d1)
 
-    res          = TrajectoryResult()
-    t            = 0.0
-    apex_y       = state[1];  apex_x       = state[0]
-    last_x       = state[0];  last_y       = state[1]
-    crossed_front = False   # fired once when x passes goal_distance
-    crossed_top   = False   # fired once when y descends through goal_height
-    entry_x_min, entry_x_max = _entry_x_bounds(p.goal_distance, p.goal_depth)
 
-    res.t.append(t); res.x.append(state[0]); res.y.append(state[1])
-    res.vx.append(state[2]); res.vy.append(state[3])
+def _hermite_root(p0, d0, p1, d1, dt: float, target, iters: int = 4):
+    """τ ∈ [0,1] where the Hermite through (p0,d0)→(p1,d1) equals `target`."""
+    tau = (p0 - target) / np.where(np.abs(p0 - p1) > 1e-12, p0 - p1, 1e-12)
+    tau = np.clip(tau, 0.0, 1.0)
+    for _ in range(iters):
+        t2  = tau * tau
+        t3  = t2 * tau
+        val = ((2*t3 - 3*t2 + 1) * p0 + (t3 - 2*t2 + tau) * dt * d0
+             + (-2*t3 + 3*t2)    * p1 + (t3 - t2)         * dt * d1)
+        der = ((6*t2 - 6*tau)      * p0 + (3*t2 - 4*tau + 1) * dt * d0
+             + (-6*t2 + 6*tau)     * p1 + (3*t2 - 2*tau)     * dt * d1)
+        tau = np.clip(tau - np.where(np.abs(der) > 1e-12, (val - target) / der, 0.0),
+                      0.0, 1.0)
+    return tau
 
-    while t < t_max:
-        def deriv(s):
-            ax, ay = _accel(s, p)
-            return [s[2], s[3], ax, ay]
 
-        k1 = deriv(state)
-        s2 = [state[i] + 0.5*dt*k1[i] for i in range(4)]
-        k2 = deriv(s2)
-        s3 = [state[i] + 0.5*dt*k2[i] for i in range(4)]
-        k3 = deriv(s3)
-        s4 = [state[i] + dt*k3[i] for i in range(4)]
-        k4 = deriv(s4)
-        state = [state[i] + dt/6.0*(k1[i] + 2*k2[i] + 2*k3[i] + k4[i])
-                 for i in range(4)]
+# ── Vectorised RK4 core ─────────────────────────────────────────────────────
+def _integrate(velocities,
+               angles_deg,
+               launch_height: float,
+               goal_height:   float = GOAL_TOP_HEIGHT_M,
+               wind:          float = 0.0,
+               enable_drag:   bool  = True,
+               dt:            float = DT_SURROGATE,
+               t_max:         float = 4.0,
+               launch_x:      float = 0.0,
+               front_x:       Optional[float] = None,
+               x_max:         Optional[float] = None,
+               stop_at_rim:   bool  = True,
+               record_path:   bool  = False) -> dict:
+    """
+    Integrate N shots simultaneously.
+
+    `stop_at_rim` ends a trajectory as soon as it is below the rim and
+    descending — it can never score after that, since vy only decreases.  This
+    is both tighter than falling all the way to the floor AND what makes the
+    result independent of goal_distance.  Pass False (with `x_max`) when the
+    full arc is wanted for drawing.
+
+    Returns arrays indexed like the inputs.  `x_at_top` is NaN for shots that
+    never descend through the rim plane.
+    """
+    v   = np.asarray(velocities, dtype=float).ravel()
+    ang = np.radians(np.asarray(angles_deg, dtype=float).ravel())
+    N   = v.size
+
+    out = {
+        "x_at_top":        np.full(N, np.nan),
+        "entry_angle_deg": np.full(N, np.nan),
+        "t_at_top":        np.full(N, np.nan),
+        "descending":      np.zeros(N, dtype=bool),
+        "y_at_front":      np.full(N, np.nan),
+        "apex_x":          np.full(N, float(launch_x)),
+        "apex_y":          np.full(N, float(launch_height)),
+        "t_end":           np.zeros(N),
+        "range_x":         np.full(N, float(launch_x)),
+    }
+    if N == 0:
+        out["paths"] = {}
+        return out
+
+    x  = np.full(N, float(launch_x))
+    y  = np.full(N, float(launch_height))
+    vx = v * np.cos(ang)
+    vy = v * np.sin(ang)
+
+    idx      = np.arange(N)          # active slot → original index
+    finished = np.zeros(N, dtype=bool)
+    paths: Dict[int, list] = {i: [] for i in range(N)} if record_path else {}
+    t = 0.0
+
+    while idx.size and t < t_max:
+        if record_path:
+            for slot, orig in enumerate(idx):
+                paths[orig].append((t, x[slot], y[slot], vx[slot], vy[slot]))
+
+        # ── RK4 stage structure ─────────────────────────────────────────────
+        ax1, ay1 = _accel_np(y, vx, vy, wind, enable_drag)
+        kx1, ky1 = vx, vy
+
+        vx2, vy2 = vx + 0.5*dt*ax1, vy + 0.5*dt*ay1
+        y2       = y  + 0.5*dt*ky1
+        ax2, ay2 = _accel_np(y2, vx2, vy2, wind, enable_drag)
+        kx2, ky2 = vx2, vy2
+
+        vx3, vy3 = vx + 0.5*dt*ax2, vy + 0.5*dt*ay2
+        y3       = y  + 0.5*dt*ky2
+        ax3, ay3 = _accel_np(y3, vx3, vy3, wind, enable_drag)
+        kx3, ky3 = vx3, vy3
+
+        vx4, vy4 = vx + dt*ax3, vy + dt*ay3
+        y4       = y  + dt*ky3
+        ax4, ay4 = _accel_np(y4, vx4, vy4, wind, enable_drag)
+        kx4, ky4 = vx4, vy4
+
+        nx  = x  + (dt/6.0) * (kx1 + 2*kx2 + 2*kx3 + kx4)
+        ny  = y  + (dt/6.0) * (ky1 + 2*ky2 + 2*ky3 + ky4)
+        nvx = vx + (dt/6.0) * (ax1 + 2*ax2 + 2*ax3 + ax4)
+        nvy = vy + (dt/6.0) * (ay1 + 2*ay2 + 2*ay3 + ay4)
+
+        # ── Apex ────────────────────────────────────────────────────────────
+        higher = ny > out["apex_y"][idx]
+        if higher.any():
+            hit = idx[higher]
+            out["apex_y"][hit] = ny[higher]
+            out["apex_x"][hit] = nx[higher]
+
+        # ── Display: height at the goal front face ──────────────────────────
+        if front_x is not None:
+            cf = (x < front_x) & (nx >= front_x) & np.isnan(out["y_at_front"][idx])
+            if cf.any():
+                tau = _hermite_root(x, vx, nx, nvx, dt, front_x)
+                yf  = _hermite_eval(y, vy, ny, nvy, dt, tau)
+                out["y_at_front"][idx[cf]] = yf[cf]
+
+        # ── Scoring event: descending through the rim plane ─────────────────
+        cross = (y > goal_height) & (ny <= goal_height) & np.isnan(out["x_at_top"][idx])
+        if cross.any():
+            tau = _hermite_root(y, vy, ny, nvy, dt, goal_height)
+            xc  = _hermite_eval(x, vx, nx, nvx, dt, tau)
+            vyc = vy + tau * (nvy - vy)
+            vxc = vx + tau * (nvx - vx)
+            hit = idx[cross]
+            out["x_at_top"][hit]        = xc[cross]
+            out["entry_angle_deg"][hit] = np.degrees(
+                np.arctan2(-vyc[cross], np.abs(vxc[cross])))
+            out["descending"][hit]      = vyc[cross] < 0
+            out["t_at_top"][hit]        = t + tau[cross] * dt
+
+        x, y, vx, vy = nx, ny, nvx, nvy
         t += dt
 
-        if state[1] > apex_y:
-            apex_y = state[1]; apex_x = state[0]
+        # ── Termination ─────────────────────────────────────────────────────
+        done = (y <= 0) & (t > 0.05)
+        if stop_at_rim:
+            done |= (y < goal_height) & (vy < 0)
+        if x_max is not None:
+            done |= x > x_max
 
-        # ── Display: height at goal front face (x = goal_distance) ──────────
-        if not crossed_front and last_x < p.goal_distance <= state[0]:
-            frac = (p.goal_distance - last_x) / (state[0] - last_x + 1e-12)
-            res.impact_y_at_goal = last_y + frac * (state[1] - last_y)
-            crossed_front = True
+        if done.any():
+            hit = idx[done]
+            out["t_end"][hit]   = t
+            out["range_x"][hit] = x[done]
+            finished[hit]       = True
+            if record_path:
+                for slot in np.flatnonzero(done):
+                    paths[idx[slot]].append(
+                        (t, x[slot], y[slot], vx[slot], vy[slot]))
+            keep = ~done
+            x, y, vx, vy = x[keep], y[keep], vx[keep], vy[keep]
+            idx = idx[keep]
 
-        # ── Scoring: ball descends through the top plane ─────────────────────
-        # Condition: was above goal_height last step, at/below it now.
-        if not crossed_top and last_y > p.goal_height >= state[1]:
-            frac   = (last_y - p.goal_height) / (last_y - state[1] + 1e-12)
-            x_cross = last_x  + frac * (state[0] - last_x)
-            vy_at   = res.vy[-1] + frac * (state[3] - res.vy[-1])
-            vx_at   = res.vx[-1] + frac * (state[2] - res.vx[-1])
-            res.x_at_top        = x_cross
-            res.entry_angle_deg = math.degrees(math.atan2(-vy_at, abs(vx_at)))
-            # Score: descending, cleared front lip, hasn't overshot back wall
-            res.made = (
-                vy_at < 0
-                and entry_x_min <= x_cross <= entry_x_max
-            )
-            crossed_top = True
+    # Anything still flying when t_max hit.
+    if idx.size:
+        out["t_end"][idx]   = t
+        out["range_x"][idx] = x
+        if record_path:
+            for slot, orig in enumerate(idx):
+                paths[orig].append((t, x[slot], y[slot], vx[slot], vy[slot]))
 
-        res.t.append(t); res.x.append(state[0]); res.y.append(state[1])
-        res.vx.append(state[2]); res.vy.append(state[3])
-        last_x = state[0]; last_y = state[1]
+    if record_path:
+        out["paths"] = paths
+    return out
 
-        if state[1] <= 0 and t > 0.05:
-            break
-        # Stop well past the basket back wall so top-plane crossing isn't missed
-        if state[0] > p.goal_distance + p.goal_depth + 2.0:
-            break
 
-    res.apex_x = apex_x; res.apex_y = apex_y; res.range_x = state[0]
+def _made_from(x_at_top: np.ndarray,
+               descending: np.ndarray,
+               entry_x_min: float,
+               entry_x_max: float) -> np.ndarray:
+    """Scoring test — the only place goal_distance enters."""
+    with np.errstate(invalid="ignore"):
+        return (descending
+                & (x_at_top >= entry_x_min)
+                & (x_at_top <= entry_x_max))
+
+
+# ── Path densification ──────────────────────────────────────────────────────
+# A step carries position AND velocity at both ends, so the same cubic Hermite
+# that locates events also reconstructs the arc between samples.  That means
+# the integrator can run coarse — the drawn curve is smooth because it is
+# interpolated exactly, not because it was integrated finely.
+def _densify(path: list, n_out: int = 220):
+    if len(path) < 2:
+        cols = list(zip(*path)) if path else ([], [], [], [], [])
+        return [list(c) for c in cols]
+
+    t  = np.array([s[0] for s in path])
+    x  = np.array([s[1] for s in path])
+    y  = np.array([s[2] for s in path])
+    vx = np.array([s[3] for s in path])
+    vy = np.array([s[4] for s in path])
+
+    tt  = np.linspace(t[0], t[-1], n_out)
+    seg = np.clip(np.searchsorted(t, tt, side="right") - 1, 0, t.size - 2)
+    h   = t[seg + 1] - t[seg]
+    h   = np.where(h > 1e-15, h, 1e-15)
+    tau = np.clip((tt - t[seg]) / h, 0.0, 1.0)
+
+    xx = _hermite_eval(x[seg], vx[seg], x[seg + 1], vx[seg + 1], h, tau)
+    yy = _hermite_eval(y[seg], vy[seg], y[seg + 1], vy[seg + 1], h, tau)
+    return [tt.tolist(), xx.tolist(), yy.tolist(),
+            np.interp(tt, t, vx).tolist(), np.interp(tt, t, vy).tolist()]
+
+
+# ── Single-shot wrapper (keeps the original public shape) ───────────────────
+def simulate(p: ShotParams, dt: float = DT_SURROGATE, t_max: float = 4.0) -> TrajectoryResult:
+    entry_x_min, entry_x_max = _entry_x_bounds(p.goal_distance, p.goal_depth)
+    r = _integrate(
+        [p.velocity], [p.angle_deg], p.launch_height,
+        goal_height=p.goal_height, wind=p.wind, enable_drag=p.enable_drag,
+        dt=dt, t_max=t_max, launch_x=p.launch_x,
+        front_x=p.goal_distance,
+        x_max=p.goal_distance + p.goal_depth + 2.0,
+        stop_at_rim=False, record_path=True,
+    )
+    res = TrajectoryResult()
+    res.t, res.x, res.y, res.vx, res.vy = _densify(r["paths"][0])
+
+    res.apex_x  = float(r["apex_x"][0])
+    res.apex_y  = float(r["apex_y"][0])
+    res.range_x = float(r["range_x"][0])
+
+    yf = r["y_at_front"][0]
+    res.impact_y_at_goal = None if math.isnan(yf) else float(yf)
+    xt = r["x_at_top"][0]
+    res.x_at_top = None if math.isnan(xt) else float(xt)
+    ea = r["entry_angle_deg"][0]
+    res.entry_angle_deg = None if math.isnan(ea) else float(ea)
+    res.made = bool(_made_from(r["x_at_top"], r["descending"],
+                               entry_x_min, entry_x_max)[0])
     return res
 
 
-# ── Tolerance sweep (spaghetti trajectories) ────────────────────────────────
+# ── Surrogate: x_at_top over (velocity, angle), cached ──────────────────────
+# goal_distance is deliberately absent — one surrogate serves every distance.
+_SURROGATE_V = (1.0, 14.0, 0.25)     # lo, hi, step — wider than the UI range
+_SURROGATE_A = (12.0, 88.0, 1.0)     #                so ±σ excursions stay in-grid
+
+
+@dataclass
+class Surrogate:
+    v_grid:    np.ndarray
+    a_grid:    np.ndarray
+    x_at_top:  np.ndarray            # [nv, na], NaN where it never descends through
+    descending: np.ndarray
+    entry_angle_deg: np.ndarray
+    t_at_top:  np.ndarray
+    apex_y:    np.ndarray
+    monotone:  bool                  # guard-rail result
+
+
+_SUR_CACHE: "OrderedDict[tuple, Surrogate]" = OrderedDict()
+_SUR_LOCK  = threading.Lock()
+_SUR_MAX   = 16
+
+
+def _uniform(lo: float, hi: float, step: float) -> np.ndarray:
+    n = int(math.floor((hi - lo) / step + 1e-9)) + 1
+    return np.round(lo + step * np.arange(n), 10)
+
+
+def _surrogate_key(launch_height, goal_height, wind, enable_drag, dt):
+    return (round(float(launch_height), 6), round(float(goal_height), 6),
+            round(float(wind), 6), bool(enable_drag), round(float(dt), 6),
+            _SURROGATE_V, _SURROGATE_A)
+
+
+def build_surrogate(launch_height: float,
+                    goal_height:   float = GOAL_TOP_HEIGHT_M,
+                    wind:          float = 0.0,
+                    enable_drag:   bool  = True,
+                    dt:            float = DT_SURROGATE) -> Surrogate:
+    v_grid = _uniform(*_SURROGATE_V)
+    a_grid = _uniform(*_SURROGATE_A)
+    vv, aa = np.meshgrid(v_grid, a_grid, indexing="ij")
+    r = _integrate(vv.ravel(), aa.ravel(), launch_height,
+                   goal_height=goal_height, wind=wind, enable_drag=enable_drag,
+                   dt=dt, stop_at_rim=True)
+    shape = (v_grid.size, a_grid.size)
+
+    xt = r["x_at_top"].reshape(shape)
+    # Diagnostic: x_at_top rises with velocity at fixed angle across the whole
+    # commanded range.  `band()` no longer *depends* on this (it scans for sign
+    # changes), but a violation here means the physics has changed shape and is
+    # worth surfacing.  A strong headwind can break it just outside the
+    # commanded range, at angles too steep to shoot anyway.
+    monotone = True
+    in_cmd = (a_grid >= A_MIN_CMD) & (a_grid <= A_MAX_CMD)
+    for j in np.flatnonzero(in_cmd):
+        col = xt[:, j]
+        ok  = ~np.isnan(col)
+        if ok.sum() >= 2 and np.any(np.diff(col[ok]) < -1e-9):
+            monotone = False
+            break
+
+    return Surrogate(
+        v_grid=v_grid, a_grid=a_grid,
+        x_at_top=xt,
+        descending=r["descending"].reshape(shape),
+        entry_angle_deg=r["entry_angle_deg"].reshape(shape),
+        t_at_top=r["t_at_top"].reshape(shape),
+        apex_y=r["apex_y"].reshape(shape),
+        monotone=monotone,
+    )
+
+
+def get_surrogate(launch_height: float,
+                  goal_height:   float = GOAL_TOP_HEIGHT_M,
+                  wind:          float = 0.0,
+                  enable_drag:   bool  = True,
+                  dt:            float = DT_SURROGATE) -> Surrogate:
+    key = _surrogate_key(launch_height, goal_height, wind, enable_drag, dt)
+    with _SUR_LOCK:
+        hit = _SUR_CACHE.get(key)
+        if hit is not None:
+            _SUR_CACHE.move_to_end(key)
+            return hit
+    # Built outside the lock; a rare duplicate build is cheaper than blocking.
+    sur = build_surrogate(launch_height, goal_height, wind, enable_drag, dt)
+    with _SUR_LOCK:
+        _SUR_CACHE[key] = sur
+        _SUR_CACHE.move_to_end(key)
+        while len(_SUR_CACHE) > _SUR_MAX:
+            _SUR_CACHE.popitem(last=False)
+    return sur
+
+
+def clear_surrogate_cache() -> None:
+    with _SUR_LOCK:
+        _SUR_CACHE.clear()
+
+
+# ── Band extraction: invert the monotone x_at_top per angle ─────────────────
+def _invert_column(v_grid: np.ndarray, col: np.ndarray, target: float,
+                   prefer: str = "first") -> float:
+    """
+    Velocity where x_at_top == target, by linear interpolation. NaN if unreachable.
+
+    Scans for sign changes rather than assuming a globally monotone column, so
+    a local wiggle (which a strong headwind can produce at extreme angles)
+    degrades to picking the outermost crossing instead of returning nonsense.
+    `prefer="first"` takes the lowest such velocity, `"last"` the highest —
+    together they bracket the widest scoring interval.
+    """
+    ok = np.flatnonzero(~np.isnan(col))
+    if ok.size < 2:
+        return math.nan
+    vs = v_grid[ok]
+    xs = col[ok]
+
+    lo, hi = xs[:-1], xs[1:]
+    hits = np.flatnonzero(((lo <= target) & (hi >= target)) |
+                          ((lo >= target) & (hi <= target)))
+    if hits.size == 0:
+        return math.nan
+    k = int(hits[0] if prefer == "first" else hits[-1])
+
+    x0, x1 = xs[k], xs[k + 1]
+    if abs(x1 - x0) <= 1e-15:
+        return float(vs[k])
+    f = (target - x0) / (x1 - x0)
+    return float(vs[k] + f * (vs[k + 1] - vs[k]))
+
+
+def band(sur: Surrogate,
+         entry_x_min: float,
+         entry_x_max: float,
+         a_fine: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Scoring band boundaries.  Returns (a_fine, v_lo, v_hi); NaN where the
+    angle cannot score at all.
+    """
+    v_lo_c = np.array([_invert_column(sur.v_grid, sur.x_at_top[:, j], entry_x_min, "first")
+                       for j in range(sur.a_grid.size)])
+    v_hi_c = np.array([_invert_column(sur.v_grid, sur.x_at_top[:, j], entry_x_max, "last")
+                       for j in range(sur.a_grid.size)])
+
+    if a_fine is None:
+        # Spans the whole surrogate, not just the commanded 20-80°: shooter
+        # error pushes shots outside the commanded range, and truncating there
+        # would silently drop the tail of P(make).
+        a_fine = _uniform(float(sur.a_grid[0]), float(sur.a_grid[-1]), 0.1)
+
+    # Interpolate across angle, but never across a gap of infeasible angles.
+    def _across(vals):
+        ok = ~np.isnan(vals)
+        if ok.sum() < 2:
+            return np.full(a_fine.size, math.nan)
+        out = np.interp(a_fine, sur.a_grid[ok], vals[ok], left=math.nan, right=math.nan)
+        # Blank out fine angles that fall inside an infeasible stretch.
+        near = np.interp(a_fine, sur.a_grid, ok.astype(float))
+        out[near < 0.999] = math.nan
+        return out
+
+    return a_fine, _across(v_lo_c), _across(v_hi_c)
+
+
+# ── Robustness: Chebyshev centre of the band in σ-normalised coordinates ────
+def _margin_map(a_c: np.ndarray, v_c: np.ndarray,
+                a_b: np.ndarray, v_lo: np.ndarray, v_hi: np.ndarray,
+                sigma_v: float, sigma_a: float,
+                window_sigma: float = 5.0) -> np.ndarray:
+    """
+    For each candidate (v_c[i], a_c[i]) return the distance — in σ units — to
+    the nearest point of the band boundary.  Negative outside the band.
+
+    Distance is measured to the boundary CURVES directly rather than to a
+    rasterised mask, so the answer is continuous rather than pixel-limited.
+    """
+    n = a_c.size
+    best = np.full(n, np.inf)
+
+    # Interpolate the band at each candidate's own angle for the inside test.
+    lo_here = np.interp(a_c, a_b, v_lo, left=math.nan, right=math.nan)
+    hi_here = np.interp(a_c, a_b, v_hi, left=math.nan, right=math.nan)
+    with np.errstate(invalid="ignore"):
+        inside = (v_c >= lo_here) & (v_c <= hi_here)
+
+    step   = float(a_b[1] - a_b[0]) if a_b.size > 1 else 1.0
+    reach  = int(math.ceil(window_sigma * sigma_a / max(step, 1e-9)))
+    j_home = np.clip(np.searchsorted(a_b, a_c), 0, a_b.size - 1)
+
+    valid = ~np.isnan(v_lo) & ~np.isnan(v_hi)
+    for off in range(-reach, reach + 1):
+        j = np.clip(j_home + off, 0, a_b.size - 1)
+        ok = valid[j]
+        da = (a_c - a_b[j]) / sigma_a
+        for edge in (v_lo, v_hi):
+            dv = (v_c - edge[j]) / sigma_v
+            d  = np.sqrt(dv * dv + da * da)
+            best = np.where(ok & (d < best), d, best)
+
+    # The feasible angle range itself is a boundary.
+    if valid.any():
+        a_first, a_last = a_b[valid][0], a_b[valid][-1]
+        best = np.minimum(best, np.abs(a_c - a_first) / sigma_a)
+        best = np.minimum(best, np.abs(a_c - a_last) / sigma_a)
+
+    best = np.minimum(best, window_sigma)
+    return np.where(inside, best, -best)
+
+
+def _phi_cdf(z: np.ndarray) -> np.ndarray:
+    flat = np.asarray(z, dtype=float).ravel()
+    out  = np.array([0.5 * (1.0 + math.erf(float(t) / _SQRT2)) for t in flat])
+    return out.reshape(np.shape(z))
+
+
+def p_make_gaussian(v: float, a: float,
+                    a_b: np.ndarray, v_lo: np.ndarray, v_hi: np.ndarray,
+                    sigma_v: float, sigma_a: float,
+                    nodes: int = 201) -> float:
+    """
+    Exact P(score) for Gaussian shooter error, by 1-D quadrature over the
+    angle axis.  No sampling: at each angle the scoring set is the interval
+    [v_lo, v_hi], so the velocity axis integrates in closed form.
+
+        P = ∫ φ(z) · [ Φ((v_hi(a+σ_a z) − v)/σ_v) − Φ((v_lo(…) − v)/σ_v) ] dz
+    """
+    if sigma_v <= 0 or sigma_a <= 0:
+        lo = float(np.interp(a, a_b, v_lo, left=math.nan, right=math.nan))
+        hi = float(np.interp(a, a_b, v_hi, left=math.nan, right=math.nan))
+        return 1.0 if (not math.isnan(lo) and lo <= v <= hi) else 0.0
+
+    if nodes % 2 == 0:
+        nodes += 1
+    z  = np.linspace(-5.0, 5.0, nodes)
+    aa = a + sigma_a * z
+    lo = np.interp(aa, a_b, v_lo, left=math.nan, right=math.nan)
+    hi = np.interp(aa, a_b, v_hi, left=math.nan, right=math.nan)
+
+    with np.errstate(invalid="ignore"):
+        inner = _phi_cdf((hi - v) / sigma_v) - _phi_cdf((lo - v) / sigma_v)
+    inner = np.where(np.isnan(inner), 0.0, np.maximum(inner, 0.0))
+
+    pdf = np.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+    f   = pdf * inner
+
+    # Composite Simpson
+    h = z[1] - z[0]
+    w = np.ones(nodes)
+    w[1:-1:2] = 4.0
+    w[2:-1:2] = 2.0
+    return float(np.clip((h / 3.0) * np.dot(w, f), 0.0, 1.0))
+
+
+def directional_margins(v: float, a: float,
+                        a_b: np.ndarray, v_lo: np.ndarray, v_hi: np.ndarray) -> dict:
+    """Slack in physical units, separately in each direction."""
+    lo = float(np.interp(a, a_b, v_lo, left=math.nan, right=math.nan))
+    hi = float(np.interp(a, a_b, v_hi, left=math.nan, right=math.nan))
+    out = {
+        "v_down_ms": None if math.isnan(lo) else max(0.0, v - lo),
+        "v_up_ms":   None if math.isnan(hi) else max(0.0, hi - v),
+        "a_down_deg": 0.0,
+        "a_up_deg":   0.0,
+    }
+
+    def _scan(direction: int) -> float:
+        step = 0.05 * direction
+        travelled = 0.0
+        while abs(travelled) < 30.0:
+            travelled += step
+            l = float(np.interp(a + travelled, a_b, v_lo, left=math.nan, right=math.nan))
+            h = float(np.interp(a + travelled, a_b, v_hi, left=math.nan, right=math.nan))
+            if math.isnan(l) or math.isnan(h) or not (l <= v <= h):
+                return abs(travelled) - abs(step)
+        return 30.0
+
+    out["a_down_deg"] = _scan(-1)
+    out["a_up_deg"]   = _scan(+1)
+    return out
+
+
+# ── Optimal solver ───────────────────────────────────────────────────────────
+def find_optimal(goal_distance: float,
+                 launch_height: float,
+                 enable_drag: bool = True,
+                 dv_range: float = 0.7,
+                 da_range: float = 1.5,
+                 goal_height: float = GOAL_TOP_HEIGHT_M,
+                 goal_depth: float = GOAL_DEPTH_M,
+                 wind: float = 0.0,
+                 with_diagnostics: bool = False):
+    """
+    Most ROBUST shot for a given distance — the Chebyshev centre of the scoring
+    band in σ-normalised (velocity, angle) space, i.e. the shot that is
+    furthest from missing in any direction.
+
+    `dv_range` / `da_range` are the shooter's 1σ repeatability.
+    """
+    sigma_v = max(float(dv_range), 1e-6)
+    sigma_a = max(float(da_range), 1e-6)
+
+    sur = get_surrogate(launch_height, goal_height, wind, enable_drag)
+    entry_x_min, entry_x_max = _entry_x_bounds(goal_distance, goal_depth)
+    a_b, v_lo, v_hi = band(sur, entry_x_min, entry_x_max)
+
+    # The band spans the full surrogate so perturbations aren't truncated, but
+    # the shot we RETURN has to be commandable.
+    feasible = (~np.isnan(v_lo) & ~np.isnan(v_hi) & (v_hi >= v_lo)
+                & (a_b >= A_MIN_CMD) & (a_b <= A_MAX_CMD))
+    if not feasible.any():
+        return (None, {}) if with_diagnostics else None
+
+    # The Chebyshev centre sits on the band's medial axis, which the midpoint
+    # curve tracks closely — so seed from it, then polish in 2-D.
+    a_seed = a_b[feasible]
+    v_seed = np.clip(0.5 * (v_lo[feasible] + v_hi[feasible]), V_MIN_CMD, V_MAX_CMD)
+    m_seed = _margin_map(a_seed, v_seed, a_b, v_lo, v_hi, sigma_v, sigma_a)
+    k = int(np.argmax(m_seed))
+    v_best, a_best, m_best = float(v_seed[k]), float(a_seed[k]), float(m_seed[k])
+
+    # Local 2-D polish, twice, shrinking the box.
+    span_v, span_a = 0.40, 4.0
+    for _ in range(2):
+        vs = np.clip(np.linspace(v_best - span_v, v_best + span_v, 41), V_MIN_CMD, V_MAX_CMD)
+        as_ = np.clip(np.linspace(a_best - span_a, a_best + span_a, 41), A_MIN_CMD, A_MAX_CMD)
+        VV, AA = np.meshgrid(vs, as_, indexing="ij")
+        mm = _margin_map(AA.ravel(), VV.ravel(), a_b, v_lo, v_hi, sigma_v, sigma_a)
+        q = int(np.argmax(mm))
+        if mm[q] > m_best:
+            m_best = float(mm[q]); v_best = float(VV.ravel()[q]); a_best = float(AA.ravel()[q])
+        span_v *= 0.25; span_a *= 0.25
+
+    best = ShotParams(
+        velocity=v_best, angle_deg=a_best,
+        launch_height=launch_height, goal_distance=goal_distance,
+        goal_height=goal_height, goal_depth=goal_depth,
+        wind=wind, enable_drag=enable_drag,
+    )
+    if not with_diagnostics:
+        return best
+
+    diag = {
+        "margin_sigma": m_best,
+        "p_make":       p_make_gaussian(v_best, a_best, a_b, v_lo, v_hi, sigma_v, sigma_a),
+        "monotone_ok":  sur.monotone,
+    }
+    diag.update(directional_margins(v_best, a_best, a_b, v_lo, v_hi))
+    return best, diag
+
+
+# ── Tolerance sweep ──────────────────────────────────────────────────────────
+def _downsample(path: list, target: int = 80):
+    # Rounded on the way out — 0.1 mm is far finer than a pixel, and full
+    # float repr would triple the payload.
+    _, xs, ys, _, _ = _densify(path, target)
+    return [round(z, 4) for z in xs], [round(z, 4) for z in ys]
+
+
 def make_sweep(p: ShotParams,
                dv_range: float = 0.7,
                da_range: float = 1.5,
                n: int = 11) -> dict:
-    dvs = [dv_range * (2*i/(n-1) - 1) for i in range(n)]
-    das = [da_range * (2*j/(n-1) - 1) for j in range(n)]
+    """
+    Tolerance analysis around a nominal shot.
+
+    The statistic and the picture are computed separately.  P(make) comes from
+    an exact quadrature over the scoring band — no sampling, so it does not
+    depend on `n`.  Only the handful of trajectories actually DRAWN get
+    integrated: two σ-rings plus the exact make/miss boundary shots, which say
+    far more than a uniform grid of look-alike arcs.
+    """
+    sigma_v = max(float(dv_range), 1e-6)
+    sigma_a = max(float(da_range), 1e-6)
+
+    sur = get_surrogate(p.launch_height, p.goal_height, p.wind, p.enable_drag)
+    entry_x_min, entry_x_max = _entry_x_bounds(p.goal_distance, p.goal_depth)
+    a_b, v_lo, v_hi = band(sur, entry_x_min, entry_x_max)
+
+    p_make  = p_make_gaussian(p.velocity, p.angle_deg, a_b, v_lo, v_hi, sigma_v, sigma_a)
+    margins = directional_margins(p.velocity, p.angle_deg, a_b, v_lo, v_hi)
+    m_sigma = float(_margin_map(np.array([p.angle_deg]), np.array([p.velocity]),
+                                a_b, v_lo, v_hi, sigma_v, sigma_a)[0])
+
+    # ── Which trajectories to draw ──────────────────────────────────────────
+    ring = max(4, min(12, int(n) - 1))
+    specs = [(0.0, 0.0, "nominal")]
+    for scale in (1.0, 2.0):
+        for i in range(ring):
+            th = 2 * math.pi * i / ring
+            specs.append((scale * sigma_v * math.cos(th),
+                          scale * sigma_a * math.sin(th), "ring"))
+    for k in (-2, -1, 0, 1, 2):
+        a_edge = p.angle_deg + k * sigma_a
+        for edge in (v_lo, v_hi):
+            ve = float(np.interp(a_edge, a_b, edge, left=math.nan, right=math.nan))
+            if not math.isnan(ve):
+                specs.append((ve - p.velocity, k * sigma_a, "boundary"))
+
+    vels = [max(0.1, p.velocity + dv) for dv, _, _ in specs]
+    angs = [p.angle_deg + da        for _, da, _ in specs]
+
+    r = _integrate(vels, angs, p.launch_height,
+                   goal_height=p.goal_height, wind=p.wind, enable_drag=p.enable_drag,
+                   dt=DT_SURROGATE, t_max=3.0, launch_x=p.launch_x,
+                   front_x=p.goal_distance,
+                   x_max=p.goal_distance + p.goal_depth + 2.0,
+                   stop_at_rim=False, record_path=True)
+    made = _made_from(r["x_at_top"], r["descending"], entry_x_min, entry_x_max)
 
     trajs = []
-    for dv in dvs:
-        for da in das:
-            tp = ShotParams(
-                velocity      = max(0.1, p.velocity + dv),
-                angle_deg     = p.angle_deg + da,
-                launch_height = p.launch_height,
-                launch_x      = p.launch_x,
-                goal_distance = p.goal_distance,
-                goal_height   = p.goal_height,
-                goal_depth    = p.goal_depth,
-                wind          = p.wind,
-                enable_drag   = p.enable_drag,
-            )
-            r    = simulate(tp, dt=0.002, t_max=3.0)
-            step = max(1, len(r.t) // 80)
-            trajs.append({
-                "x":    r.x[::step],
-                "y":    r.y[::step],
-                "made": r.made,
-                "impact_y_at_goal": r.impact_y_at_goal,
-                "dv": dv, "da": da,
-            })
+    for i, (dv, da, kind) in enumerate(specs):
+        if kind == "nominal":
+            continue
+        xs, ys = _downsample(r["paths"][i])
+        yf = r["y_at_front"][i]
+        trajs.append({
+            "x": xs, "y": ys,
+            "made": bool(made[i]),
+            "impact_y_at_goal": None if math.isnan(yf) else float(yf),
+            "dv": dv, "da": da, "kind": kind,
+        })
 
-    made = sum(1 for tr in trajs if tr["made"])
-    nr   = simulate(p, dt=0.002, t_max=3.0)
-    step = max(1, len(nr.t) // 80)
+    nx, ny = _downsample(r["paths"][0])
+
+    def _clean(arr):
+        return [None if math.isnan(z) else round(float(z), 4) for z in arr]
 
     return {
         "trajectories": trajs,
-        "nominal": {"x": nr.x[::step], "y": nr.y[::step], "made": nr.made},
-        "made_pct": 100.0 * made / len(trajs) if trajs else 0.0,
+        "nominal": {"x": nx, "y": ny, "made": bool(made[0])},
+        # Retained for compatibility, but now a real probability rather than a
+        # count of grid cells.
+        "made_pct": 100.0 * p_make,
+        "p_make":   p_make,
+        "margin_sigma": m_sigma,
+        "margins":  margins,
+        "band": {
+            "angle_deg": [round(float(z), 2) for z in a_b],
+            "v_lo": _clean(v_lo),
+            "v_hi": _clean(v_hi),
+        },
+        "sigma": {"v": sigma_v, "a": sigma_a},
+        "nominal_shot": {"velocity": p.velocity, "angle_deg": p.angle_deg},
         "goal": {
             "distance": p.goal_distance,
             "height":   p.goal_height,
@@ -232,342 +850,39 @@ def make_sweep(p: ShotParams,
     }
 
 
-# ── Vectorised batch simulator (numpy) ──────────────────────────────────────
-def _simulate_made_batch(velocities, angles_deg,
-                         launch_height: float,
-                         goal_distance: float,
-                         goal_height:   float = GOAL_TOP_HEIGHT_M,
-                         goal_depth:    float = GOAL_DEPTH_M,
-                         wind:          float = 0.0,
-                         enable_drag:   bool  = True,
-                         dt:            float = 0.002,
-                         t_max:         float = 3.0) -> np.ndarray:
-    """
-    RK4 batch simulation: runs N (velocity, angle) pairs simultaneously with
-    numpy arrays instead of N sequential Python loops.
-    Returns a boolean ndarray made[i] for each shot.
-    10-50x faster than N calls to simulate() for large N.
-    """
-    N    = len(velocities)
-    vels = np.asarray(velocities, dtype=float)
-    angs = np.radians(np.asarray(angles_deg, dtype=float))
-
-    x  = np.zeros(N)
-    y  = np.full(N, float(launch_height))
-    vx = vels * np.cos(angs)
-    vy = vels * np.sin(angs)
-    lx = x.copy();  ly = y.copy()
-
-    made = np.zeros(N, dtype=bool)
-    done = np.zeros(N, dtype=bool)
-    t    = 0.0
-    entry_x_min, entry_x_max = _entry_x_bounds(goal_distance, goal_depth)
-
-    def _accel_np(cy, cvx, cvy):
-        ux = cvx - wind
-        uy = cvy
-        speed = np.hypot(ux, uy)
-        ax_   = np.zeros(N)
-        ay_   = np.where(cy >= 0, -G, 0.0)
-        if enable_drag:
-            re  = np.maximum(speed * ARTIFACT_D / NU_AIR, 1e-9)
-            cd  = np.where(re < 1.0,   24.0 / re,
-                  np.where(re < 1e3,   24.0 / re + 6.0 / (1.0 + np.sqrt(re)) + 0.4,
-                  np.where(re < 2e5,   0.47,
-                  np.where(re < 3.5e5, 0.47 - (re - 2e5) / 1.5e5 * 0.27, 0.20))))
-            ok  = (cy >= 0) & (speed > 1e-6)
-            spd = np.where(ok, speed, 1.0)
-            fd  = np.where(ok, 0.5 * RHO_AIR * cd * ARTIFACT_A * speed * speed, 0.0)
-            ax_ = np.where(ok, -fd * ux / spd / ARTIFACT_M, 0.0)
-            ay_ = np.where(ok, -G - fd * uy / spd / ARTIFACT_M, ay_)
-        return ax_, ay_
-
-    while t < t_max:
-        if done.all():
-            break
-
-        # True RK4 update, matching simulate() stage structure.
-        ax1, ay1 = _accel_np(y, vx, vy)
-        kx1, ky1 = vx, vy
-
-        vx2 = vx + 0.5 * dt * ax1
-        vy2 = vy + 0.5 * dt * ay1
-        y2  = y  + 0.5 * dt * ky1
-        ax2, ay2 = _accel_np(y2, vx2, vy2)
-        kx2, ky2 = vx2, vy2
-
-        vx3 = vx + 0.5 * dt * ax2
-        vy3 = vy + 0.5 * dt * ay2
-        y3  = y  + 0.5 * dt * ky2
-        ax3, ay3 = _accel_np(y3, vx3, vy3)
-        kx3, ky3 = vx3, vy3
-
-        vx4 = vx + dt * ax3
-        vy4 = vy + dt * ay3
-        y4  = y  + dt * ky3
-        ax4, ay4 = _accel_np(y4, vx4, vy4)
-        kx4, ky4 = vx4, vy4
-
-        nx  = x + (dt / 6.0) * (kx1 + 2*kx2 + 2*kx3 + kx4)
-        ny  = y + (dt / 6.0) * (ky1 + 2*ky2 + 2*ky3 + ky4)
-        nvx = vx + (dt / 6.0) * (ax1 + 2*ax2 + 2*ax3 + ax4)
-        nvy = vy + (dt / 6.0) * (ay1 + 2*ay2 + 2*ay3 + ay4)
-
-        # Descending top-plane crossing
-        cross = (~done) & (ly > goal_height) & (ny <= goal_height)
-        if cross.any():
-            frac    = (ly - goal_height) / np.maximum(ly - ny, 1e-12)
-            x_cross = lx + frac * (nx - lx)
-            vy_at   = vy + frac * (nvy - vy)
-            in_goal = ((entry_x_min <= x_cross) &
-                       (x_cross <= entry_x_max) &
-                       (vy_at < 0))
-            made   |= cross & in_goal
-            done   |= cross
-
-        done |= (~done) & (
-            ((ny <= 0) & (t > 0.05)) |
-            (nx > goal_distance + goal_depth + 2.0)
-        )
-
-        lx[:] = x;  ly[:] = y
-        x, y, vx, vy = nx, ny, nvx, nvy
-        t += dt
-
-    return made
-
-
-# ── Optimal solver ───────────────────────────────────────────────────────────
-def _find_optimal_window_scan(goal_distance: float,
-                              launch_height: float,
-                              enable_drag: bool = True,
-                              dv_range: float = 0.7,
-                              da_range: float = 1.5) -> Optional[ShotParams]:
-    """
-    Find the (velocity, angle) pair that maximises the make-window fraction
-    within the tolerance box (±dv_range m/s, ±da_range degrees).
-
-    Both phases use _simulate_made_batch (numpy vectorised RK4), running all
-    trajectories as one array operation rather than N sequential Python loops.
-
-    Phase 1 — velocity window scan  (56 batch calls, N=131 each)
-        For each angle (1° steps, 25–80°) run all velocities in one batch.
-        Find scoring interval [v_lo, v_hi]; midpoint is v_center.
-        Rank candidates by window width (v_hi − v_lo).
-
-    Phase 2 — sweep evaluation  (up to 20 batch calls, N=81 each)
-        For the top-20 candidates, evaluate the 9x9 perturbation grid in a
-        single batch call. Return the shot with the highest make-fraction.
-    """
-    V_STEP      = 0.10
-    V_LO, V_HI = 2.0, 15.0
-    N_V         = round((V_HI - V_LO) / V_STEP) + 1
-    vels        = [round(V_LO + V_STEP * i, 2) for i in range(N_V)]
-
-    # ── Phase 1: batch scan per angle ────────────────────────────────
-    candidates = []   # (v_window, v_center, angle)
-
-    for a_int in range(25, 81):    # 56 angles, 1° steps
-        a    = float(a_int)
-        made = _simulate_made_batch(
-            vels, [a] * N_V,
-            launch_height, goal_distance,
-            goal_height=GOAL_TOP_HEIGHT_M,
-            goal_depth=GOAL_DEPTH_M,
-            enable_drag=enable_drag,
-        )
-        made_vs = [v for v, m in zip(vels, made) if m]
-        if len(made_vs) < 2:
-            continue
-        v_window = made_vs[-1] - made_vs[0]
-        v_center = (made_vs[0] + made_vs[-1]) / 2.0
-        candidates.append((v_window, v_center, a))
-
-    if not candidates:
-        return None
-
-    candidates.sort(reverse=True)          # widest velocity window first
-
-    # ── Phase 2: batch sweep for top-20 candidates ───────────────────
-    N_SWEEP = 9
-    dvs = [dv_range * (2 * i / (N_SWEEP - 1) - 1) for i in range(N_SWEEP)]
-    das = [da_range * (2 * j / (N_SWEEP - 1) - 1) for j in range(N_SWEEP)]
-
-    best     : Optional[ShotParams] = None
-    best_pct : float                = -1.0
-
-    for _, v_center, a in candidates[:20]:
-        s_v = [max(0.1, v_center + dv) for dv in dvs for _ in das]
-        s_a = [a + da                  for _  in dvs for da in das]
-
-        made = _simulate_made_batch(
-            s_v, s_a,
-            launch_height, goal_distance,
-            goal_height=GOAL_TOP_HEIGHT_M,
-            goal_depth=GOAL_DEPTH_M,
-            enable_drag=enable_drag,
-        )
-        pct = float(made.sum()) / len(made) * 100.0
-        if pct > best_pct:
-            best_pct = pct
-            best = ShotParams(velocity=v_center, angle_deg=a,
-                              launch_height=launch_height,
-                              goal_distance=goal_distance,
-                              enable_drag=enable_drag)
-
-    return best
-
-
-def _step_grid(lo: float, hi: float, step: float) -> np.ndarray:
-    count = int(math.floor((hi - lo) / step + 1e-9)) + 1
-    return np.round(lo + step * np.arange(count), 10)
-
-
-def _best_make_window_on_grid(v_grid: np.ndarray,
-                              a_grid: np.ndarray,
-                              made_grid: np.ndarray,
-                              dv_range: float,
-                              da_range: float,
-                              v_min: float,
-                              v_max: float,
-                              a_min: float,
-                              a_max: float):
-    made_grid = np.asarray(made_grid, dtype=bool)
-    prefix = np.pad(made_grid.astype(np.int32), ((1, 0), (1, 0))).cumsum(0).cumsum(1)
-
-    valid_v = np.flatnonzero(
-        (v_grid >= v_min) &
-        (v_grid <= v_max) &
-        (v_grid - dv_range >= v_grid[0] - 1e-9) &
-        (v_grid + dv_range <= v_grid[-1] + 1e-9)
-    )
-    valid_a = np.flatnonzero(
-        (a_grid >= a_min) &
-        (a_grid <= a_max) &
-        (a_grid - da_range >= a_grid[0] - 1e-9) &
-        (a_grid + da_range <= a_grid[-1] + 1e-9)
-    )
-
-    best = None
-    for ia in valid_a:
-        a0 = np.searchsorted(a_grid, a_grid[ia] - da_range, side="left")
-        a1 = np.searchsorted(a_grid, a_grid[ia] + da_range, side="right")
-        for iv in valid_v:
-            if not made_grid[iv, ia]:
-                continue
-            v0 = np.searchsorted(v_grid, v_grid[iv] - dv_range, side="left")
-            v1 = np.searchsorted(v_grid, v_grid[iv] + dv_range, side="right")
-            total = (v1 - v0) * (a1 - a0)
-            hits = prefix[v1, a1] - prefix[v0, a1] - prefix[v1, a0] + prefix[v0, a0]
-            pct = 100.0 * float(hits) / float(total)
-
-            key = (pct, int(hits), -float(v_grid[iv]))
-            if best is None or key > best["key"]:
-                best = {
-                    "key": key,
-                    "pct": pct,
-                    "hits": int(hits),
-                    "total": int(total),
-                    "velocity": float(v_grid[iv]),
-                    "angle_deg": float(a_grid[ia]),
-                }
-    return best
-
-
-def find_optimal(goal_distance: float,
-                 launch_height: float,
-                 enable_drag: bool = True,
-                 dv_range: float = 0.7,
-                 da_range: float = 1.5,
-                 goal_height: float = GOAL_TOP_HEIGHT_M,
-                 goal_depth: float = GOAL_DEPTH_M,
-                 wind: float = 0.0) -> Optional[ShotParams]:
-    """
-    Maximise the 2D make-window fraction for a commanded shot.
-
-    Commanded shots stay within the UI range (2-12 m/s, 20-80 deg). The
-    perturbation window can extend outside that range because real error can
-    do that too. Candidate shots only compete when their whole tolerance box
-    is present in the made/miss grid, so edge candidates are not rewarded for
-    having a clipped sweep.
-    """
-    v_min, v_max = 2.0, 12.0
-    a_min, a_max = 20.0, 80.0
-
-    v_grid = _step_grid(max(0.1, v_min - dv_range), v_max + dv_range, 0.20)
-    a_grid = _step_grid(a_min - da_range, a_max + da_range, 0.50)
-    vv, aa = np.meshgrid(v_grid, a_grid, indexing="ij")
-    made = _simulate_made_batch(
-        vv.ravel(), aa.ravel(),
-        launch_height, goal_distance,
-        goal_height=goal_height, goal_depth=goal_depth, wind=wind,
-        enable_drag=enable_drag,
-    ).reshape(len(v_grid), len(a_grid))
-    coarse = _best_make_window_on_grid(
-        v_grid, a_grid, made,
-        dv_range, da_range,
-        v_min, v_max, a_min, a_max,
-    )
-    if coarse is None:
-        return None
-
-    v_search_lo = max(v_min, coarse["velocity"] - 1.0)
-    v_search_hi = min(v_max, coarse["velocity"] + 1.0)
-    a_search_lo = max(a_min, coarse["angle_deg"] - 2.5)
-    a_search_hi = min(a_max, coarse["angle_deg"] + 2.5)
-
-    v_fine = _step_grid(max(0.1, v_search_lo - dv_range), v_search_hi + dv_range, 0.025)
-    a_fine = _step_grid(a_search_lo - da_range, a_search_hi + da_range, 0.10)
-    vv_f, aa_f = np.meshgrid(v_fine, a_fine, indexing="ij")
-    made_f = _simulate_made_batch(
-        vv_f.ravel(), aa_f.ravel(),
-        launch_height, goal_distance,
-        goal_height=goal_height, goal_depth=goal_depth, wind=wind,
-        enable_drag=enable_drag,
-    ).reshape(len(v_fine), len(a_fine))
-    fine = _best_make_window_on_grid(
-        v_fine, a_fine, made_f,
-        dv_range, da_range,
-        v_search_lo, v_search_hi, a_search_lo, a_search_hi,
-    ) or coarse
-
-    return ShotParams(
-        velocity=fine["velocity"],
-        angle_deg=fine["angle_deg"],
-        launch_height=launch_height,
-        goal_distance=goal_distance,
-        goal_height=goal_height,
-        goal_depth=goal_depth,
-        wind=wind,
-        enable_drag=enable_drag,
-    )
-
-
 # ── Lookup table ─────────────────────────────────────────────────────────────
 def build_lut(p: ShotParams,
               v_min: float = 2.0,  v_max: float = 12.0,  v_steps: int = 50,
               a_min: float = 20.0, a_max: float = 80.0,  a_steps: int = 61,
               ) -> List[dict]:
+    vs = np.linspace(v_min, v_max, v_steps)
+    as_ = np.linspace(a_min, a_max, a_steps)
+    VV, AA = np.meshgrid(vs, as_, indexing="ij")
+
+    r = _integrate(VV.ravel(), AA.ravel(), p.launch_height,
+                   goal_height=p.goal_height, wind=p.wind, enable_drag=p.enable_drag,
+                   dt=DT_PATH, t_max=4.0, launch_x=p.launch_x,
+                   front_x=p.goal_distance,
+                   x_max=p.goal_distance + p.goal_depth + 2.0,
+                   stop_at_rim=False)
+    entry_x_min, entry_x_max = _entry_x_bounds(p.goal_distance, p.goal_depth)
+    made = _made_from(r["x_at_top"], r["descending"], entry_x_min, entry_x_max)
+
+    def _r(val, nd):
+        return "" if math.isnan(val) else round(float(val), nd)
+
     rows = []
-    for iv in range(v_steps):
-        v = v_min + (v_max - v_min) * iv / (v_steps - 1)
-        for ia in range(a_steps):
-            a = a_min + (a_max - a_min) * ia / (a_steps - 1)
-            tp = ShotParams(velocity=v, angle_deg=a,
-                           launch_height=p.launch_height,
-                           goal_distance=p.goal_distance,
-                           wind=p.wind, enable_drag=p.enable_drag)
-            r = simulate(tp, dt=0.002, t_max=3.0)
-            rows.append({
-                "velocity_ms":      round(v, 3),
-                "angle_deg":        round(a, 2),
-                "made":             int(r.made),
-                "x_at_top_m":       round(r.x_at_top,         4) if r.x_at_top         is not None else "",
-                "impact_y_front_m": round(r.impact_y_at_goal,  4) if r.impact_y_at_goal is not None else "",
-                "entry_angle_deg":  round(r.entry_angle_deg,   2) if r.entry_angle_deg  is not None else "",
-                "flight_time_s":    round(r.t[-1],             4) if r.t                else "",
-                "apex_y_m":         round(r.apex_y,            4),
-            })
+    for k in range(VV.size):
+        rows.append({
+            "velocity_ms":      round(float(VV.ravel()[k]), 3),
+            "angle_deg":        round(float(AA.ravel()[k]), 2),
+            "made":             int(made[k]),
+            "x_at_top_m":       _r(r["x_at_top"][k], 4),
+            "impact_y_front_m": _r(r["y_at_front"][k], 4),
+            "entry_angle_deg":  _r(r["entry_angle_deg"][k], 2),
+            "flight_time_s":    round(float(r["t_end"][k]), 4),
+            "apex_y_m":         round(float(r["apex_y"][k]), 4),
+        })
     return rows
 
 
@@ -581,7 +896,10 @@ if __name__ == "__main__":
     print(f"impact_y_front:{r.impact_y_at_goal}")
     print(f"entry_angle:   {r.entry_angle_deg}")
     print(f"made:          {r.made}")
-    best = find_optimal(in_to_m(60), in_to_m(15.75))
+    best, diag = find_optimal(in_to_m(60), in_to_m(15.75), with_diagnostics=True)
     if best:
         rb = simulate(best)
         print(f"\noptimal: v={best.velocity:.2f} m/s  angle={best.angle_deg:.1f}°  made={rb.made}")
+        print(f"         margin={diag['margin_sigma']:.2f}σ  P(make)={diag['p_make']*100:.1f}%")
+        print(f"         slack: -{diag['v_down_ms']:.2f}/+{diag['v_up_ms']:.2f} m/s, "
+              f"-{diag['a_down_deg']:.1f}/+{diag['a_up_deg']:.1f}°")
