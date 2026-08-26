@@ -3,17 +3,23 @@ Flask backend for DECODE Shot Simulator.
 Endpoints:
   POST /api/simulate  -> single trajectory
   POST /api/sweep     -> spaghetti sweep (all trajectories)
+  POST /api/family    -> every scoring shot at this distance, one per angle
+  POST /api/montecarlo-> N random shots drawn from the shooter's own error
+  POST /api/target_sweep -> best shot at each of a chunk of distances
   POST /api/optimize  -> find optimal (v, angle)
+  POST /api/inverse   -> solve for shots through a point at an arrival angle
   POST /api/lut       -> download CSV lookup table
 """
 import csv
 import io
+import math
 import os
 
 from flask import Flask, request, jsonify, send_from_directory, Response
 
 from physics import (
-    ShotParams, simulate, make_sweep, find_optimal, build_lut,
+    ShotParams, simulate, make_sweep, find_optimal, solve_point_arrival, build_lut,
+    shot_family, monte_carlo, sweep_targets,
     in_to_m, GOAL_TOP_HEIGHT_M, GOAL_DEPTH_M,
 )
 
@@ -106,6 +112,138 @@ def api_optimize():
         },
         "monotone_ok":  diag["monotone_ok"],
     })
+
+
+@app.route("/api/inverse", methods=["POST"])
+def api_inverse():
+    try:
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            raise ValueError("request body must be a JSON object")
+
+        required_numbers = ("target_x", "target_y", "arrival_angle_deg", "launch_height")
+        optional_numbers = {"launch_x": 0.0, "wind": 0.0}
+        numbers = {}
+
+        for name in required_numbers:
+            if name not in body:
+                raise ValueError(f"missing required field: {name}")
+            value = body[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a finite number")
+            try:
+                value = float(value)
+            except (OverflowError, ValueError):
+                raise ValueError(f"{name} must be a finite number") from None
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number")
+            numbers[name] = value
+
+        for name, default in optional_numbers.items():
+            value = body.get(name, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a finite number")
+            try:
+                value = float(value)
+            except (OverflowError, ValueError):
+                raise ValueError(f"{name} must be a finite number") from None
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number")
+            numbers[name] = value
+
+        flags = {}
+        for name, default in (("enable_drag", True),
+                              ("include_family", True),
+                              ("refine", True)):
+            value = body.get(name, default)
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean")
+            flags[name] = value
+
+        result = solve_point_arrival(
+            numbers["target_x"],
+            numbers["target_y"],
+            numbers["arrival_angle_deg"],
+            numbers["launch_height"],
+            launch_x=numbers["launch_x"],
+            wind=numbers["wind"],
+            enable_drag=flags["enable_drag"],
+            include_family=flags["include_family"],
+            refine=flags["refine"],
+        )
+        result.setdefault("ok", True)
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.route("/api/family", methods=["POST"])
+def api_family():
+    body = request.json or {}
+    p = _params(body)
+    return jsonify(shot_family(
+        p,
+        dv_range   = float(body.get("dv_range",   0.7)),
+        da_range   = float(body.get("da_range",   1.5)),
+        angle_step = float(body.get("angle_step", 1.0)),
+    ))
+
+
+@app.route("/api/montecarlo", methods=["POST"])
+def api_montecarlo():
+    body = request.json or {}
+    p = _params(body)
+    seed = body.get("seed")
+    return jsonify(monte_carlo(
+        p,
+        dv_range = float(body.get("dv_range", 0.7)),
+        da_range = float(body.get("da_range", 1.5)),
+        n        = int(body.get("samples",  250)),
+        seed     = None if seed is None else int(seed),
+    ))
+
+
+# Deliberately stateless: the client sends one chunk of distances per request
+# and owns the progress bar.  No job registry, no streaming, and — because the
+# surrogate is cached across requests — no cost to splitting the work up.
+MAX_SWEEP_CHUNK = 32
+
+
+@app.route("/api/target_sweep", methods=["POST"])
+def api_target_sweep():
+    try:
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            raise ValueError("request body must be a JSON object")
+
+        raw = body.get("distances")
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("distances must be a non-empty list")
+        if len(raw) > MAX_SWEEP_CHUNK:
+            raise ValueError(f"at most {MAX_SWEEP_CHUNK} distances per request")
+
+        distances = []
+        for value in raw:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("each distance must be a finite number")
+            value = float(value)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("each distance must be a positive, finite number")
+            distances.append(value)
+
+        p = _params(body)
+        rows = sweep_targets(
+            distances, p.launch_height,
+            enable_drag = p.enable_drag,
+            dv_range    = float(body.get("dv_range", 0.7)),
+            da_range    = float(body.get("da_range", 1.5)),
+            goal_height = p.goal_height,
+            goal_depth  = p.goal_depth,
+            wind        = p.wind,
+        )
+        return jsonify({"ok": True, "rows": rows})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
 
 
 @app.route("/api/lut", methods=["POST"])

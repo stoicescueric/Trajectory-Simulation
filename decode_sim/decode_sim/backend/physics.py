@@ -750,6 +750,370 @@ def find_optimal(goal_distance: float,
 
 
 # ── Tolerance sweep ──────────────────────────────────────────────────────────
+def _inverse_float(name: str, value) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be a finite number")
+    try:
+        out = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not math.isfinite(out):
+        raise ValueError(f"{name} must be a finite number")
+    return out
+
+
+def _inverse_inputs(target_x, target_y, launch_height, launch_x, wind, enable_drag):
+    values = [_inverse_float(n, z) for n, z in (
+        ("target_x", target_x), ("target_y", target_y),
+        ("launch_height", launch_height), ("launch_x", launch_x), ("wind", wind))]
+    target_x, target_y, launch_height, launch_x, wind = values
+    if not isinstance(enable_drag, (bool, np.bool_)):
+        raise ValueError("enable_drag must be boolean")
+    if target_x <= launch_x:
+        raise ValueError("target_x must be greater than launch_x")
+    if target_y < 0.0 or launch_height < 0.0:
+        raise ValueError("target_y and launch_height must be at or above the floor")
+    return target_x, target_y, launch_height, launch_x, wind, bool(enable_drag)
+
+
+def _angle_slice(sur: Surrogate, values: np.ndarray, angle: float) -> np.ndarray:
+    """Interpolate one surrogate column without interpolating through NaNs."""
+    j = int(np.searchsorted(sur.a_grid, angle))
+    if j < sur.a_grid.size and abs(float(sur.a_grid[j]) - angle) < 1e-10:
+        return np.asarray(values[:, j], dtype=float)
+    if j <= 0 or j >= sur.a_grid.size:
+        return np.full(sur.v_grid.size, math.nan)
+    a0, a1 = float(sur.a_grid[j - 1]), float(sur.a_grid[j])
+    c0 = np.asarray(values[:, j - 1], dtype=float)
+    c1 = np.asarray(values[:, j], dtype=float)
+    out = np.full(c0.size, math.nan)
+    ok = np.isfinite(c0) & np.isfinite(c1)
+    f = (angle - a0) / (a1 - a0)
+    out[ok] = c0[ok] + f * (c1[ok] - c0[ok])
+    return out
+
+
+def _point_roots(v_grid: np.ndarray, x_col: np.ndarray, target_range: float) -> List[float]:
+    """All commandable roots in one piecewise-linear velocity column."""
+    roots = []
+    for i in range(v_grid.size - 1):
+        v0, v1 = float(v_grid[i]), float(v_grid[i + 1])
+        if v0 < V_MIN_CMD - 1e-12 or v1 > V_MAX_CMD + 1e-12:
+            continue
+        x0, x1 = float(x_col[i]), float(x_col[i + 1])
+        if not (math.isfinite(x0) and math.isfinite(x1)):
+            continue
+        f0, f1 = x0 - target_range, x1 - target_range
+        if abs(f0) <= 1e-12:
+            roots.append(v0)
+        if f0 * f1 < 0.0 or abs(f1) <= 1e-12:
+            f = 0.0 if abs(x1 - x0) <= 1e-15 else (target_range - x0) / (x1 - x0)
+            roots.append(float(np.clip(v0 + f * (v1 - v0), V_MIN_CMD, V_MAX_CMD)))
+    roots.sort()
+    return [v for i, v in enumerate(roots) if i == 0 or abs(v - roots[i - 1]) > 1e-8]
+
+
+def _column_value(v_grid: np.ndarray, col: np.ndarray, velocity: float) -> Optional[float]:
+    j = int(np.searchsorted(v_grid, velocity))
+    if j < v_grid.size and abs(float(v_grid[j]) - velocity) < 1e-10:
+        val = float(col[j])
+        return val if math.isfinite(val) else None
+    if j <= 0 or j >= v_grid.size:
+        return None
+    v0, v1 = float(v_grid[j - 1]), float(v_grid[j])
+    z0, z1 = float(col[j - 1]), float(col[j])
+    if not (math.isfinite(z0) and math.isfinite(z1)):
+        return None
+    return z0 + (velocity - v0) / (v1 - v0) * (z1 - z0)
+
+
+def point_family(target_x: float,
+                 target_y: float,
+                 launch_height: float,
+                 *,
+                 launch_x: float = 0.0,
+                 wind: float = 0.0,
+                 enable_drag: bool = True) -> dict:
+    """All commandable launch families descending through a target point."""
+    (target_x, target_y, launch_height, launch_x,
+     wind, enable_drag) = _inverse_inputs(
+        target_x, target_y, launch_height, launch_x, wind, enable_drag)
+    target_range = target_x - launch_x
+    sur = get_surrogate(launch_height, target_y, wind, enable_drag)
+
+    # Find roots at fine angles directly. Active branches are discarded at an
+    # empty angle, so infeasible gaps can never be bridged by interpolation.
+    raw_branches: List[list] = []
+    active: List[int] = []
+    for angle in _uniform(A_MIN_CMD, A_MAX_CMD, 0.1):
+        angle = float(angle)
+        x_col = _angle_slice(sur, sur.x_at_top, angle)
+        entry_col = _angle_slice(sur, sur.entry_angle_deg, angle)
+        time_col = _angle_slice(sur, sur.t_at_top, angle)
+        apex_col = _angle_slice(sur, sur.apex_y, angle)
+        current = []
+        for velocity in _point_roots(sur.v_grid, x_col, target_range):
+            values = [_column_value(sur.v_grid, col, velocity)
+                      for col in (entry_col, time_col, apex_col)]
+            if any(z is None for z in values):
+                continue
+            current.append({
+                "velocity_ms": float(velocity),
+                "launch_angle_deg": angle,
+                "arrival_angle_deg": float(values[0]),
+                "flight_time_s": float(values[1]),
+                "apex_y_m": float(values[2]),
+            })
+
+        pairs = sorted((abs(raw_branches[bi][-1]["velocity_ms"] - p["velocity_ms"]), bi, ri)
+                       for bi in active for ri, p in enumerate(current))
+        used_b, used_r, next_active = set(), set(), []
+        for _, bi, ri in pairs:
+            if bi in used_b or ri in used_r:
+                continue
+            raw_branches[bi].append(current[ri])
+            used_b.add(bi); used_r.add(ri); next_active.append(bi)
+        for ri, point in enumerate(current):
+            if ri not in used_r:
+                raw_branches.append([point]); next_active.append(len(raw_branches) - 1)
+        active = next_active
+
+    family = []
+    for points in raw_branches:
+        if not points:
+            continue
+        branch_index = len(family)
+        for point in points:
+            point["branch_index"] = branch_index
+        family.append({
+            "branch_index": branch_index,
+            "angle_range_deg": [points[0]["launch_angle_deg"], points[-1]["launch_angle_deg"]],
+            "velocity_range_ms": [min(p["velocity_ms"] for p in points),
+                                  max(p["velocity_ms"] for p in points)],
+            "arrival_angle_range_deg": [min(p["arrival_angle_deg"] for p in points),
+                                        max(p["arrival_angle_deg"] for p in points)],
+            "points": points,
+        })
+
+    target = {
+        "x_m": target_x, "y_m": target_y, "range_m": target_range,
+        "launch_x_m": launch_x, "launch_height_m": launch_height,
+        "wind_ms": wind, "enable_drag": enable_drag,
+    }
+    return {
+        "ok": bool(family),
+        "target": target,
+        "solutions": [],  # A point constraint leaves a continuous family.
+        "family": family,
+        "diagnostics": {
+            "solution_kind": "one_dimensional_family",
+            "descending_only": True,
+            "branch_count": len(family),
+            "family_point_count": sum(len(b["points"]) for b in family),
+            "family_angle_step_deg": 0.1,
+            "surrogate_monotone_in_velocity": bool(sur.monotone),
+            "command_velocity_range_ms": [V_MIN_CMD, V_MAX_CMD],
+            "command_angle_range_deg": [A_MIN_CMD, A_MAX_CMD],
+        },
+    }
+
+
+def _direct_point_event(velocity: float, angle_deg: float, target_y: float,
+                        launch_height: float, wind: float,
+                        enable_drag: bool) -> Optional[dict]:
+    r = _integrate([velocity], [angle_deg], launch_height,
+                   goal_height=target_y, wind=wind, enable_drag=enable_drag,
+                   dt=DT_PATH, t_max=4.0, launch_x=0.0, stop_at_rim=True)
+    x = float(r["x_at_top"][0])
+    angle = float(r["entry_angle_deg"][0])
+    time_ = float(r["t_at_top"][0])
+    if not (bool(r["descending"][0]) and math.isfinite(x)
+            and math.isfinite(angle) and math.isfinite(time_)):
+        return None
+    return {
+        "x": x,
+        "arrival_angle_deg": angle,
+        "flight_time_s": time_,
+        "apex_y_m": float(r["apex_y"][0]),
+    }
+
+
+def _refine_point_seed(seed: dict, target_range: float, target_y: float,
+                       launch_height: float, wind: float, enable_drag: bool,
+                       arrival_angle: float) -> dict:
+    """Bounded damped Newton refinement with finite-difference derivatives."""
+    q = np.array([seed["velocity_ms"], seed["launch_angle_deg"]], dtype=float)
+    lo = np.array([V_MIN_CMD, A_MIN_CMD]); hi = np.array([V_MAX_CMD, A_MAX_CMD])
+    pos_tol, angle_tol = 2e-5, 2e-3
+    iterations = 0
+
+    def evaluate(qq):
+        event = _direct_point_event(float(qq[0]), float(qq[1]), target_y,
+                                    launch_height, wind, enable_drag)
+        if event is None:
+            return None, None
+        return np.array([event["x"] - target_range,
+                         event["arrival_angle_deg"] - arrival_angle]), event
+
+    residual, event = evaluate(q)
+    for iteration in range(1, 11):
+        if residual is None or (abs(float(residual[0])) <= pos_tol
+                                and abs(float(residual[1])) <= angle_tol):
+            break
+        iterations = iteration
+        jac = np.empty((2, 2))
+        valid = True
+        for k, step in enumerate((max(1e-3, abs(float(q[0])) * 2e-4), 0.01)):
+            qm, qp = q.copy(), q.copy()
+            qm[k] = max(lo[k], q[k] - step); qp[k] = min(hi[k], q[k] + step)
+            rm, _ = evaluate(qm) if qm[k] < q[k] else (None, None)
+            rp, _ = evaluate(qp) if qp[k] > q[k] else (None, None)
+            if rm is not None and rp is not None:
+                jac[:, k] = (rp - rm) / (qp[k] - qm[k])
+            elif rp is not None:
+                jac[:, k] = (rp - residual) / (qp[k] - q[k])
+            elif rm is not None:
+                jac[:, k] = (residual - rm) / (q[k] - qm[k])
+            else:
+                valid = False
+                break
+        if not valid or not np.all(np.isfinite(jac)):
+            break
+        try:
+            delta = np.linalg.solve(jac, -residual)
+        except np.linalg.LinAlgError:
+            delta, *_ = np.linalg.lstsq(jac, -residual, rcond=None)
+        if not np.all(np.isfinite(delta)):
+            break
+        delta /= max(abs(float(delta[0])) / 1.0,
+                     abs(float(delta[1])) / 5.0, 1.0)
+        old_norm = math.hypot(float(residual[0]) / 0.01,
+                              float(residual[1]) / 0.1)
+        accepted = False
+        damping = 1.0
+        for _ in range(8):
+            candidate = np.clip(q + damping * delta, lo, hi)
+            rr, ee = evaluate(candidate)
+            if rr is not None and math.hypot(float(rr[0]) / 0.01,
+                                             float(rr[1]) / 0.1) < old_norm:
+                q, residual, event, accepted = candidate, rr, ee, True
+                break
+            damping *= 0.5
+        if not accepted:
+            break
+
+    converged = (residual is not None
+                 and abs(float(residual[0])) <= pos_tol
+                 and abs(float(residual[1])) <= angle_tol)
+    if event is None:
+        return {
+            **seed, "refined": True, "converged": False,
+            "iterations": iterations, "x_residual_m": None,
+            "angle_residual_deg": None,
+        }
+    return {
+        "branch_index": seed["branch_index"],
+        "velocity_ms": float(q[0]),
+        "launch_angle_deg": float(q[1]),
+        "arrival_angle_deg": float(event["arrival_angle_deg"]),
+        "flight_time_s": float(event["flight_time_s"]),
+        "apex_y_m": float(event["apex_y_m"]),
+        "x_residual_m": float(residual[0]),
+        "angle_residual_deg": float(residual[1]),
+        "refined": True,
+        "converged": bool(converged),
+        "iterations": iterations,
+    }
+
+
+def solve_point_arrival(target_x: float,
+                        target_y: float,
+                        arrival_angle_deg: float,
+                        launch_height: float,
+                        *,
+                        launch_x: float = 0.0,
+                        wind: float = 0.0,
+                        enable_drag: bool = True,
+                        refine: bool = True,
+                        include_family: bool = True) -> dict:
+    """All commandable descending point hits at a positive-downward angle."""
+    arrival_angle_deg = _inverse_float("arrival_angle_deg", arrival_angle_deg)
+    if not 0.0 <= arrival_angle_deg < 90.0:
+        raise ValueError("arrival_angle_deg must be in [0, 90)")
+    if not isinstance(refine, (bool, np.bool_)):
+        raise ValueError("refine must be boolean")
+    if not isinstance(include_family, (bool, np.bool_)):
+        raise ValueError("include_family must be boolean")
+
+    base = point_family(target_x, target_y, launch_height, launch_x=launch_x,
+                        wind=wind, enable_drag=enable_drag)
+    seeds = []
+    for branch in base["family"]:
+        points = branch["points"]
+
+        def add_seed(p0, p1=None, fraction=0.0):
+            if p1 is None:
+                seed = dict(p0)
+            else:
+                seed = {key: float(p0[key] + fraction * (p1[key] - p0[key]))
+                        for key in ("velocity_ms", "launch_angle_deg",
+                                    "arrival_angle_deg", "flight_time_s", "apex_y_m")}
+                seed["branch_index"] = branch["branch_index"]
+            if not any(abs(seed["velocity_ms"] - old["velocity_ms"]) < 1e-7
+                       and abs(seed["launch_angle_deg"] - old["launch_angle_deg"]) < 1e-7
+                       for old in seeds):
+                seeds.append(seed)
+
+        for i, point in enumerate(points):
+            f0 = point["arrival_angle_deg"] - arrival_angle_deg
+            if abs(f0) <= 1e-10:
+                add_seed(point)
+            if i + 1 < len(points):
+                next_point = points[i + 1]
+                f1 = next_point["arrival_angle_deg"] - arrival_angle_deg
+                if f0 * f1 < 0.0:
+                    add_seed(point, next_point, -f0 / (f1 - f0))
+
+    solutions = []
+    for seed in seeds:
+        if bool(refine):
+            sol = _refine_point_seed(
+                seed, base["target"]["range_m"], base["target"]["y_m"],
+                base["target"]["launch_height_m"], base["target"]["wind_ms"],
+                base["target"]["enable_drag"], arrival_angle_deg)
+        else:
+            sol = {
+                **seed, "x_residual_m": 0.0,
+                "angle_residual_deg": seed["arrival_angle_deg"] - arrival_angle_deg,
+                "refined": False, "converged": None, "iterations": 0,
+            }
+        if not any(abs(sol["velocity_ms"] - old["velocity_ms"]) < 1e-5
+                   and abs(sol["launch_angle_deg"] - old["launch_angle_deg"]) < 1e-5
+                   for old in solutions):
+            solutions.append(sol)
+    solutions.sort(key=lambda z: (z["launch_angle_deg"], z["velocity_ms"]))
+
+    target = dict(base["target"])
+    target["arrival_angle_deg"] = arrival_angle_deg
+    result = {
+        "ok": bool(solutions),
+        "target": target,
+        "solutions": solutions,
+        "diagnostics": {
+            **base["diagnostics"],
+            "solution_kind": "isolated_point_and_arrival_angle",
+            "seed_count": len(seeds),
+            "solution_count": len(solutions),
+            "refine_requested": bool(refine),
+            "converged_count": sum(s["converged"] is True for s in solutions),
+        },
+    }
+    if bool(include_family):
+        result["family"] = base["family"]
+    return result
+
+
+# ── Tolerance sweep ────────────────────────────────────────────────────────────────────────
 def _downsample(path: list, target: int = 80):
     # Rounded on the way out — 0.1 mm is far finer than a pixel, and full
     # float repr would triple the payload.
@@ -848,6 +1212,242 @@ def make_sweep(p: ShotParams,
             "depth":    p.goal_depth,
         },
     }
+
+
+# ── Shot family: every commandable shot that scores at one distance ─────────
+def shot_family(p: ShotParams,
+                dv_range:   float = 0.7,
+                da_range:   float = 1.5,
+                angle_step: float = 1.0,
+                trials:     int   = 21) -> dict:
+    """
+    The whole family of shots that score at `p.goal_distance`.
+
+    Nothing is searched for here.  `band()` already returns the scoring
+    velocity interval [v_lo, v_hi] at every angle, so the family is read off
+    directly; at each commandable angle we keep the velocity furthest from
+    missing.  That is NOT the midpoint — the two edges curve differently — so
+    the interval is sampled and scored in a single `_margin_map` call.
+
+    Where `make_sweep` asks "how safe is THIS shot", this asks "which shots
+    score at all, and which part of that family is safe".
+    """
+    sigma_v = max(float(dv_range), 1e-6)
+    sigma_a = max(float(da_range), 1e-6)
+
+    sur = get_surrogate(p.launch_height, p.goal_height, p.wind, p.enable_drag)
+    entry_x_min, entry_x_max = _entry_x_bounds(p.goal_distance, p.goal_depth)
+    entry_width = entry_x_max - entry_x_min
+    a_b, v_lo, v_hi = band(sur, entry_x_min, entry_x_max)
+
+    step = min(5.0, max(0.1, float(angle_step)))
+    a_c  = _uniform(A_MIN_CMD, A_MAX_CMD, step)
+    lo   = np.interp(a_c, a_b, v_lo, left=math.nan, right=math.nan)
+    hi   = np.interp(a_c, a_b, v_hi, left=math.nan, right=math.nan)
+
+    # An angle is usable only if some part of its scoring interval is also
+    # commandable — clipping first would turn an out-of-range interval into a
+    # spurious single point at the slider limit.
+    with np.errstate(invalid="ignore"):
+        ok = (~np.isnan(lo) & ~np.isnan(hi) & (hi >= lo)
+              & (hi >= V_MIN_CMD) & (lo <= V_MAX_CMD))
+
+    empty = {
+        "shots": [], "best_index": None, "count": 0,
+        "angle_span": None,
+        "sigma": {"v": sigma_v, "a": sigma_a},
+        "goal": {"distance": p.goal_distance, "height": p.goal_height,
+                 "depth": p.goal_depth},
+        "launch_height": p.launch_height,
+        "angle_step": step,
+    }
+    if not ok.any():
+        return empty
+
+    a_f  = a_c[ok]
+    lo_f = np.clip(lo[ok], V_MIN_CMD, V_MAX_CMD)
+    hi_f = np.clip(hi[ok], V_MIN_CMD, V_MAX_CMD)
+
+    n_t  = max(3, int(trials))
+    frac = np.linspace(0.0, 1.0, n_t)
+    V_try = lo_f[:, None] + frac[None, :] * (hi_f - lo_f)[:, None]
+    A_try = np.repeat(a_f[:, None], n_t, axis=1)
+    m = _margin_map(A_try.ravel(), V_try.ravel(),
+                    a_b, v_lo, v_hi, sigma_v, sigma_a).reshape(V_try.shape)
+
+    rows   = np.arange(a_f.size)
+    k      = np.argmax(m, axis=1)
+    v_best = V_try[rows, k]
+    m_best = m[rows, k]
+
+    r = _integrate(v_best, a_f, p.launch_height,
+                   goal_height=p.goal_height, wind=p.wind, enable_drag=p.enable_drag,
+                   dt=DT_SURROGATE, t_max=3.0, launch_x=p.launch_x,
+                   front_x=p.goal_distance,
+                   x_max=p.goal_distance + p.goal_depth + 2.0,
+                   stop_at_rim=False, record_path=True)
+    made = _made_from(r["x_at_top"], r["descending"], entry_x_min, entry_x_max)
+
+    shots = []
+    for i in range(a_f.size):
+        xs, ys = _downsample(r["paths"][i], 70)
+        xt = r["x_at_top"][i]
+        shots.append({
+            "angle_deg":  round(float(a_f[i]), 2),
+            "velocity":   round(float(v_best[i]), 4),
+            "v_lo":       round(float(lo_f[i]), 4),
+            "v_hi":       round(float(hi_f[i]), 4),
+            "margin_sigma": round(float(m_best[i]), 4),
+            "p_make":     p_make_gaussian(float(v_best[i]), float(a_f[i]),
+                                          a_b, v_lo, v_hi, sigma_v, sigma_a),
+            # 0 = front lip, 1 = back lip.  NaN if it never crosses the rim.
+            "entry_pos":  None if math.isnan(xt) else round(
+                              float((xt - entry_x_min) / entry_width), 4),
+            "entry_angle_deg": None if math.isnan(r["entry_angle_deg"][i]) else round(
+                              float(r["entry_angle_deg"][i]), 2),
+            "flight_time": round(float(r["t_end"][i]), 4),
+            "apex_y":      round(float(r["apex_y"][i]), 4),
+            "made":        bool(made[i]),
+            "x": xs, "y": ys,
+        })
+
+    return {
+        **empty,
+        "shots":       shots,
+        "count":       len(shots),
+        "best_index":  int(np.argmax(m_best)),
+        "angle_span":  [round(float(a_f[0]), 2), round(float(a_f[-1]), 2)],
+    }
+
+
+# ── Monte-Carlo cloud: what the shooter's own scatter actually looks like ───
+def monte_carlo(p: ShotParams,
+                dv_range: float = 0.7,
+                da_range: float = 1.5,
+                n:        int   = 250,
+                seed:     Optional[int] = None,
+                path_points: int = 45) -> dict:
+    """
+    N shots drawn from the shooter's Gaussian error around the nominal command.
+
+    The empirical make fraction is returned next to the analytic
+    `p_make_gaussian` for the same shot.  They are two independent routes to
+    the same number, so a disagreement beyond sampling noise means one of them
+    is wrong — the same cross-check `verify.test_p_make` runs at 120k samples.
+    """
+    sigma_v = max(float(dv_range), 1e-6)
+    sigma_a = max(float(da_range), 1e-6)
+    n = max(1, min(600, int(n)))
+
+    sur = get_surrogate(p.launch_height, p.goal_height, p.wind, p.enable_drag)
+    entry_x_min, entry_x_max = _entry_x_bounds(p.goal_distance, p.goal_depth)
+    a_b, v_lo, v_hi = band(sur, entry_x_min, entry_x_max)
+
+    rng  = np.random.default_rng(seed)
+    dv   = rng.normal(0.0, sigma_v, n)
+    da   = rng.normal(0.0, sigma_a, n)
+    vels = np.maximum(p.velocity + dv, 0.1)
+    angs = p.angle_deg + da
+
+    r = _integrate(vels, angs, p.launch_height,
+                   goal_height=p.goal_height, wind=p.wind, enable_drag=p.enable_drag,
+                   dt=DT_SURROGATE, t_max=3.0, launch_x=p.launch_x,
+                   front_x=p.goal_distance,
+                   x_max=p.goal_distance + p.goal_depth + 2.0,
+                   stop_at_rim=False, record_path=True)
+    made = _made_from(r["x_at_top"], r["descending"], entry_x_min, entry_x_max)
+
+    samples = []
+    for i in range(n):
+        _, xs, ys, _, _ = _densify(r["paths"][i], path_points)
+        samples.append({
+            "x": [round(z, 3) for z in xs],
+            "y": [round(z, 3) for z in ys],
+            "made": bool(made[i]),
+            "velocity": round(float(vels[i]), 3),
+            "angle_deg": round(float(angs[i]), 2),
+        })
+
+    hits = int(made.sum())
+    return {
+        "samples":  samples,
+        "n":        n,
+        "hits":     hits,
+        "p_empirical": hits / n,
+        # Binomial standard error, so the UI can say how tight the estimate is.
+        "p_stderr": math.sqrt(max(hits / n * (1.0 - hits / n), 0.0) / n),
+        "p_analytic": p_make_gaussian(p.velocity, p.angle_deg,
+                                      a_b, v_lo, v_hi, sigma_v, sigma_a),
+        "sigma":    {"v": sigma_v, "a": sigma_a},
+        "nominal_shot": {"velocity": p.velocity, "angle_deg": p.angle_deg},
+        "goal": {"distance": p.goal_distance, "height": p.goal_height,
+                 "depth": p.goal_depth},
+        "launch_height": p.launch_height,
+    }
+
+
+# ── Batch solve: the most robust shot at each of many distances ─────────────
+def sweep_targets(distances,
+                  launch_height: float,
+                  enable_drag: bool = True,
+                  dv_range: float = 0.7,
+                  da_range: float = 1.5,
+                  goal_height: float = GOAL_TOP_HEIGHT_M,
+                  goal_depth:  float = GOAL_DEPTH_M,
+                  wind: float = 0.0) -> List[dict]:
+    """
+    `find_optimal` once per distance.  The surrogate does not depend on goal
+    distance, so every distance after the first is pure array arithmetic on an
+    already-built cache.
+
+    Unreachable distances come back as rows with `ok: False` rather than being
+    dropped, so a caller plotting the result can show the gap where it is.
+    """
+    ds = [float(d) for d in distances]
+    rows: List[dict] = []
+    solved: List[Tuple[int, ShotParams]] = []
+
+    for d in ds:
+        row = {"distance_m": round(d, 5), "ok": False}
+        if math.isfinite(d) and d > 0:
+            best, diag = find_optimal(d, launch_height, enable_drag=enable_drag,
+                                      dv_range=dv_range, da_range=da_range,
+                                      goal_height=goal_height, goal_depth=goal_depth,
+                                      wind=wind, with_diagnostics=True)
+            if best is not None:
+                row.update({
+                    "ok":           True,
+                    "velocity":     round(best.velocity, 4),
+                    "angle_deg":    round(best.angle_deg, 3),
+                    "margin_sigma": round(diag["margin_sigma"], 4),
+                    "p_make":       diag["p_make"],
+                    "v_down_ms":    diag["v_down_ms"],
+                    "v_up_ms":      diag["v_up_ms"],
+                    "a_down_deg":   diag["a_down_deg"],
+                    "a_up_deg":     diag["a_up_deg"],
+                })
+                solved.append((len(rows), best))
+        rows.append(row)
+
+    # One batched integration for the flight telemetry of every winner.
+    if solved:
+        r = _integrate([b.velocity for _, b in solved],
+                       [b.angle_deg for _, b in solved],
+                       launch_height, goal_height=goal_height, wind=wind,
+                       enable_drag=enable_drag, dt=DT_SURROGATE, stop_at_rim=True)
+        for k, (idx, best) in enumerate(solved):
+            lo_x, hi_x = _entry_x_bounds(best.goal_distance, goal_depth)
+            xt = r["x_at_top"][k]
+            rows[idx].update({
+                "entry_angle_deg": None if math.isnan(r["entry_angle_deg"][k]) else round(
+                                       float(r["entry_angle_deg"][k]), 2),
+                "flight_time":     None if math.isnan(r["t_at_top"][k]) else round(
+                                       float(r["t_at_top"][k]), 4),
+                "entry_pos":       None if math.isnan(xt) else round(
+                                       float((xt - lo_x) / (hi_x - lo_x)), 4),
+                "apex_y":          round(float(r["apex_y"][k]), 4),
+            })
+    return rows
 
 
 # ── Lookup table ─────────────────────────────────────────────────────────────

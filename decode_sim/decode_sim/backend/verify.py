@@ -263,8 +263,235 @@ def test_cache():
           f"size={len(P._SUR_CACHE)}")
 
 
-# ── 9. Timings ──────────────────────────────────────────────────────────────
+# ── 9. Point + arrival-angle inverse solver ─────────────────────────────────
+def test_inverse():
+    def closest(result, velocity, angle_deg):
+        solutions = result.get("solutions") or []
+        if not solutions:
+            return None
+        return min(solutions, key=lambda s:
+                   (s["velocity_ms"] - velocity) ** 2
+                   + ((s["launch_angle_deg"] - angle_deg) / 10.0) ** 2)
+
+    def direct(solution, launch_height, target_y, launch_x=0.0,
+               wind=0.0, enable_drag=True):
+        return P._integrate(
+            [solution["velocity_ms"]], [solution["launch_angle_deg"]],
+            launch_height, goal_height=target_y, wind=wind,
+            enable_drag=enable_drag, dt=0.001, launch_x=launch_x,
+            stop_at_rim=True,
+        )
+
+    # Vacuum provides an independent closed-form oracle, rather than another
+    # integration-based reference.  Arrival angle is positive downward.
+    launch_height = P.in_to_m(15.75)
+    target_x = 1.70
+    target_y = P.GOAL_TOP_HEIGHT_M
+    gamma_deg = 45.0
+    X = target_x
+    dy = target_y - launch_height
+    tan_gamma = math.tan(math.radians(gamma_deg))
+    t = math.sqrt(2.0 * (dy + X * tan_gamma) / P.G)
+    ux = X / t
+    uy = P.G * t - ux * tan_gamma
+    want_v = math.hypot(ux, uy)
+    want_a = math.degrees(math.atan2(uy, ux))
+
+    vacuum = P.solve_point_arrival(
+        target_x, target_y, gamma_deg, launch_height,
+        enable_drag=False, include_family=False, refine=True,
+    )
+    vac_best = closest(vacuum, want_v, want_a)
+    command_ok = (vac_best is not None
+                  and abs(vac_best["velocity_ms"] - want_v) < 0.01
+                  and abs(vac_best["launch_angle_deg"] - want_a) < 0.05)
+    check("inverse matches drag-off closed form", command_ok,
+          "no solution" if vac_best is None else
+          f"|Δv|={abs(vac_best['velocity_ms'] - want_v):.2e} m/s, "
+          f"|Δa|={abs(vac_best['launch_angle_deg'] - want_a):.2e}°")
+
+    if vac_best is not None:
+        r = direct(vac_best, launch_height, target_y, enable_drag=False)
+        dx = abs(float(r["x_at_top"][0]) - target_x)
+        dg = abs(float(r["entry_angle_deg"][0]) - gamma_deg)
+        check("inverse vacuum command has tight direct residuals",
+              dx < 1e-4 and dg < 0.01,
+              f"|Δx|={dx:.2e} m, |Δγ|={dg:.2e}°")
+    else:
+        check("inverse vacuum command has tight direct residuals", False, "no solution")
+
+    family = vacuum.get("family")
+    check("include_family=False omits the family payload",
+          "family" not in vacuum or family is None or len(family) == 0)
+
+    # Drag-on round trip through an arbitrary event height.  The target comes
+    # from a known command; the inverse must recover a branch near that command.
+    known_v, known_a = 6.2, 56.0
+    launch_height = 0.42
+    target_y = 0.83
+    wind = 0.35
+    truth = P._integrate(
+        [known_v], [known_a], launch_height, goal_height=target_y,
+        wind=wind, enable_drag=True, dt=0.001, stop_at_rim=True,
+    )
+    target_x = float(truth["x_at_top"][0])
+    gamma_deg = float(truth["entry_angle_deg"][0])
+    drag = P.solve_point_arrival(
+        target_x, target_y, gamma_deg, launch_height,
+        wind=wind, enable_drag=True, include_family=False, refine=True,
+    )
+    drag_best = closest(drag, known_v, known_a)
+    round_trip_ok = (drag_best is not None
+                     and abs(drag_best["velocity_ms"] - known_v) < 0.02
+                     and abs(drag_best["launch_angle_deg"] - known_a) < 0.1)
+    check("inverse drag-on round trip recovers the known command", round_trip_ok,
+          "no solution" if drag_best is None else
+          f"|Δv|={abs(drag_best['velocity_ms'] - known_v):.2e} m/s, "
+          f"|Δa|={abs(drag_best['launch_angle_deg'] - known_a):.2e}°")
+
+    if drag_best is not None:
+        r = direct(drag_best, launch_height, target_y, wind=wind)
+        dx = abs(float(r["x_at_top"][0]) - target_x)
+        dg = abs(float(r["entry_angle_deg"][0]) - gamma_deg)
+        check("inverse drag-on command has tight direct residuals",
+              dx < 1e-4 and dg < 0.01,
+              f"|Δx|={dx:.2e} m, |Δγ|={dg:.2e}°")
+    else:
+        check("inverse drag-on command has tight direct residuals", False, "no solution")
+
+    # Horizontal translation must not affect the required launch command.
+    shift = 0.37
+    shifted = P.solve_point_arrival(
+        target_x + shift, target_y, gamma_deg, launch_height,
+        launch_x=shift, wind=wind, enable_drag=True,
+        include_family=False, refine=True,
+    )
+    shifted_best = closest(shifted, known_v, known_a)
+    translation_ok = (drag_best is not None and shifted_best is not None
+                      and abs(shifted_best["velocity_ms"] - drag_best["velocity_ms"]) < 1e-8
+                      and abs(shifted_best["launch_angle_deg"]
+                              - drag_best["launch_angle_deg"]) < 1e-8)
+    check("inverse is invariant under horizontal translation", translation_ok)
+
+    invalid_raised = False
+    try:
+        P.solve_point_arrival(
+            0.0, target_y, gamma_deg, launch_height,
+            launch_x=0.0, include_family=False,
+        )
+    except ValueError:
+        invalid_raised = True
+    check("inverse rejects an event point at the launch x", invalid_raised)
+
+
+# ── 10. Timings ─────────────────────────────────────────────────────────────
 BASELINE = {"find_optimal": 1.621, "make_sweep": 1.055, "build_lut": 5.010, "simulate": 0.004748}
+
+
+# ── 10. Shot family is exactly the set of shots that score ──────────────────
+def test_family():
+    bad_score = bad_window = bad_entry = 0
+    total = 0
+    worst_best = 0.0
+    for h_in, d_in, drag, wind in CONFIGS[:4]:
+        h, d = P.in_to_m(h_in), P.in_to_m(d_in)
+        p = P.ShotParams(velocity=7.0, angle_deg=60.0, launch_height=h,
+                         goal_distance=d, wind=wind, enable_drag=drag)
+        fam = P.shot_family(p, dv_range=0.25, da_range=1.0, angle_step=1.0)
+        if not fam["count"]:
+            continue
+        total += fam["count"]
+
+        # Re-integrate the advertised commands and check they really score.
+        lo_x, hi_x = P._entry_x_bounds(d, P.GOAL_DEPTH_M)
+        r = P._integrate([s["velocity"] for s in fam["shots"]],
+                         [s["angle_deg"] for s in fam["shots"]],
+                         h, wind=wind, enable_drag=drag,
+                         dt=P.DT_SURROGATE, stop_at_rim=True)
+        bad_score += int((~P._made_from(r["x_at_top"], r["descending"], lo_x, hi_x)).sum())
+
+        for s in fam["shots"]:
+            if not (s["v_lo"] - 1e-9 <= s["velocity"] <= s["v_hi"] + 1e-9):
+                bad_window += 1
+            if s["entry_pos"] is None or not (0.0 <= s["entry_pos"] <= 1.0):
+                bad_entry += 1
+
+        # The family is quantised to whole degrees; find_optimal polishes in
+        # 2-D, so it may be marginally better but must not be MUCH better.
+        best = fam["shots"][fam["best_index"]]
+        _, diag = P.find_optimal(d, h, enable_drag=drag, wind=wind,
+                                 dv_range=0.25, da_range=1.0, with_diagnostics=True)
+        worst_best = max(worst_best, diag["margin_sigma"] - best["margin_sigma"])
+
+    check("every shot in the family scores", bad_score == 0, f"{bad_score}/{total} miss")
+    check("family speed sits inside its own scoring window", bad_window == 0,
+          f"{bad_window}/{total} outside")
+    check("family entry position inside the opening", bad_entry == 0,
+          f"{bad_entry}/{total} outside [0,1]")
+    check("family best matches find_optimal", worst_best < 0.05,
+          f"max Δmargin={worst_best:.4f}σ (1° quantisation)")
+
+
+# ── 11. Monte-Carlo cloud agrees with the analytic probability ──────────────
+def test_monte_carlo():
+    worst_z = 0.0
+    detail = ""
+    for h_in, d_in, drag, wind in CONFIGS[:4]:
+        h, d = P.in_to_m(h_in), P.in_to_m(d_in)
+        best = P.find_optimal(d, h, enable_drag=drag, wind=wind,
+                              dv_range=0.25, da_range=1.0)
+        if best is None:
+            continue
+        p = P.ShotParams(velocity=best.velocity, angle_deg=best.angle_deg,
+                         launch_height=h, goal_distance=d, wind=wind, enable_drag=drag)
+        mc = P.monte_carlo(p, dv_range=0.25, da_range=1.0, n=600, seed=11)
+        pa = mc["p_analytic"]
+        se = math.sqrt(max(pa * (1.0 - pa), 1e-9) / mc["n"])
+        z  = abs(mc["p_empirical"] - pa) / se
+        if z > worst_z:
+            worst_z, detail = z, f"{mc['p_empirical']:.3f} vs {pa:.3f}"
+    check("Monte-Carlo cloud matches analytic P(make)", worst_z < 3.5,
+          f"max z={worst_z:.2f} ({detail}, 600 samples)")
+
+
+# ── 12. Batch distance sweep reproduces the single-distance solver ──────────
+def test_target_sweep():
+    h  = P.in_to_m(15.75)
+    ds = [P.in_to_m(x) for x in range(24, 145, 8)]
+    rows = P.sweep_targets(ds, h, dv_range=0.25, da_range=1.0)
+
+    mism = 0
+    for row in rows:
+        best = P.find_optimal(row["distance_m"], h, dv_range=0.25, da_range=1.0)
+        if best is None:
+            mism += int(row["ok"])
+            continue
+        if (not row["ok"]
+                or abs(row["velocity"]  - best.velocity)  > 1e-3
+                or abs(row["angle_deg"] - best.angle_deg) > 1e-2):
+            mism += 1
+    check("sweep_targets reproduces find_optimal", mism == 0,
+          f"{mism}/{len(rows)} rows differ")
+
+    ok_rows = [r for r in rows if r["ok"]]
+
+    # Speed alone is NOT monotone in distance: the optimiser is free to drop
+    # the angle, which buys range at a lower speed.  The invariant is the
+    # conditional one — hold the angle and the speed has to rise.
+    drops = 0
+    for a, b in zip(ok_rows, ok_rows[1:]):
+        if abs(b["angle_deg"] - a["angle_deg"]) < 0.5 and b["velocity"] < a["velocity"] - 1e-6:
+            drops += 1
+    check("speed rises with distance when the angle is held", drops == 0,
+          f"{drops} violations over {len(ok_rows)} reachable distances")
+
+    # The scoring band narrows as the shot gets longer, so the best available
+    # margin can only shrink.
+    widened = sum(1 for a, b in zip(ok_rows, ok_rows[1:])
+                  if b["margin_sigma"] > a["margin_sigma"] + 1e-6)
+    check("robustness margin shrinks with distance", widened == 0,
+          f"{widened} increases; {ok_rows[0]['margin_sigma']:.2f}σ → "
+          f"{ok_rows[-1]['margin_sigma']:.2f}σ")
 
 
 def bench():
@@ -284,6 +511,10 @@ def bench():
     sweep = med(lambda: P.make_sweep(p, dv_range=0.3, da_range=1.0, n=11))
     lut = med(lambda: P.build_lut(p))
     sim = med(lambda: P.simulate(p), 20)
+    fam = med(lambda: P.shot_family(p, dv_range=0.3, da_range=1.0, angle_step=1.0))
+    mc  = med(lambda: P.monte_carlo(p, dv_range=0.3, da_range=1.0, n=250, seed=2))
+    tsw = med(lambda: P.sweep_targets([P.in_to_m(x) for x in range(24, 145, 8)], h,
+                                      dv_range=0.3, da_range=1.0))
 
     rows = [
         ("find_optimal (cold cache)", cold,  BASELINE["find_optimal"]),
@@ -296,6 +527,13 @@ def bench():
         print(f"  {name:28s} {got*1000:9.2f} ms   baseline {base*1000:9.2f} ms   "
               f"{base/got:7.1f}x")
 
+    # No baseline for these — they are new, not rewritten.
+    print("\n── timings (new views; no prior implementation to compare against) ──")
+    for name, got in (("shot_family (1°)", fam),
+                      ("monte_carlo (250)", mc),
+                      ("sweep_targets (16 d)", tsw)):
+        print(f"  {name:28s} {got*1000:9.2f} ms")
+
 
 if __name__ == "__main__":
     print("── invariants ──")
@@ -307,6 +545,10 @@ if __name__ == "__main__":
     test_cross_path()
     test_optimum()
     test_cache()
+    test_inverse()
+    test_family()
+    test_monte_carlo()
+    test_target_sweep()
     bench()
     print("\n" + ("ALL CHECKS PASSED" if not FAILS else f"FAILURES: {FAILS}"))
     raise SystemExit(1 if FAILS else 0)
