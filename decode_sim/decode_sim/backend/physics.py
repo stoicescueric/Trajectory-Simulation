@@ -72,6 +72,11 @@ A_MIN_CMD, A_MAX_CMD = 20.0, 80.0
 
 _SQRT2 = math.sqrt(2.0)
 
+# `band()` reproduces the exact scoring boundary to about this (verify.py test
+# 4 measures it).  Commands are held this far inside the band so a boundary-
+# hugging pick can't advertise a shot that actually misses.
+_BAND_TOL = 5e-3                   # m/s
+
 
 def in_to_m(inches: float) -> float:  return inches * 0.0254
 def m_to_in(m: float)       -> float:  return m / 0.0254
@@ -576,7 +581,8 @@ def band(sur: Surrogate,
     return a_fine, _across(v_lo_c), _across(v_hi_c)
 
 
-# ── Robustness: Chebyshev centre of the band in σ-normalised coordinates ────
+# ── Reported robustness: clearance to the band edge in σ-normalised units ──
+# Read out next to the chosen shot; `_window_map` below is what CHOOSES it.
 def _margin_map(a_c: np.ndarray, v_c: np.ndarray,
                 a_b: np.ndarray, v_lo: np.ndarray, v_hi: np.ndarray,
                 sigma_v: float, sigma_a: float,
@@ -619,6 +625,95 @@ def _margin_map(a_c: np.ndarray, v_c: np.ndarray,
 
     best = np.minimum(best, window_sigma)
     return np.where(inside, best, -best)
+
+
+# ── Neighbourhood make-window: the original decision rule ──────────────────
+def _window_map(a_c: np.ndarray, v_c: np.ndarray,
+                a_b: np.ndarray, v_lo: np.ndarray, v_hi: np.ndarray,
+                dv_range: float, da_range: float,
+                n_v: int = 21, n_a: int = 21) -> np.ndarray:
+    """
+    Fraction of the ±dv_range × ±da_range tolerance box around each candidate
+    that scores.
+
+    This is the original solver's criterion: rasterise the box around a
+    candidate command and count how much of it still goes in.  The box is
+    sampled on an n_a x n_v lattice exactly as the old sweep did; only the
+    made/miss test has changed source.  It used to come from re-simulating a
+    (velocity, angle) grid — here it is read straight off the band, since
+    x_at_top rises with velocity and therefore v_lo(a) <= v <= v_hi(a) IS the
+    made test.  Same answer, exact at any lattice resolution, and free once
+    the surrogate is cached.
+
+    Unlike `_margin_map` this measures AREA, not clearance: a candidate wedged
+    against one edge of a fat band beats one centred in a thin one.
+    """
+    a_c = np.asarray(a_c, dtype=float).ravel()
+    v_c = np.asarray(v_c, dtype=float).ravel()
+
+    da = np.linspace(-da_range, da_range, max(3, int(n_a)))
+    dv = np.linspace(-dv_range, dv_range, max(3, int(n_v)))
+
+    aa = a_c[:, None] + da[None, :]                            # [n, n_a]
+    lo = np.interp(aa, a_b, v_lo, left=math.nan, right=math.nan)
+    hi = np.interp(aa, a_b, v_hi, left=math.nan, right=math.nan)
+
+    vv = v_c[:, None, None] + dv[None, None, :]                # [n, 1, n_v]
+    with np.errstate(invalid="ignore"):
+        made = (vv >= lo[:, :, None]) & (vv <= hi[:, :, None])  # NaN -> False
+    return made.reshape(a_c.size, -1).mean(axis=1)
+
+
+def _inset(lo, hi, tol: float = _BAND_TOL):
+    """
+    Pull a scoring interval `tol` in from both ends, collapsing to the midpoint
+    when it is too thin to inset.  Ties in the window fraction are broken
+    toward the slower shot, which parks the winner right on `v_lo` — and the
+    band knows that boundary only to ~`tol`, so without the inset the solver
+    can hand back a command that misses by a millimetre.
+    """
+    lo = np.asarray(lo, dtype=float)
+    hi = np.asarray(hi, dtype=float)
+    mid = 0.5 * (lo + hi)
+    wide = (hi - lo) > 2.0 * tol
+    return (np.where(wide, lo + tol, mid),
+            np.where(wide, hi - tol, mid))
+
+
+def _scores(a_c: np.ndarray, v_c: np.ndarray,
+            a_b: np.ndarray, v_lo: np.ndarray, v_hi: np.ndarray) -> np.ndarray:
+    """Does the nominal command itself go in, with the boundary inset applied?"""
+    lo = np.interp(a_c, a_b, v_lo, left=math.nan, right=math.nan)
+    hi = np.interp(a_c, a_b, v_hi, left=math.nan, right=math.nan)
+    lo, hi = _inset(lo, hi)
+    with np.errstate(invalid="ignore"):
+        return (v_c >= lo) & (v_c <= hi)
+
+
+def _best_window(v_g: np.ndarray, a_g: np.ndarray,
+                 a_b: np.ndarray, v_lo: np.ndarray, v_hi: np.ndarray,
+                 dv_range: float, da_range: float):
+    """
+    Highest make-window fraction over the (v_g x a_g) rectangle.
+
+    Ranking key is the old solver's: window fraction first, then the SLOWER
+    shot.  Windows plateau at 100% over whole regions, so the tie-break is
+    doing real work — without it the winner would just be wherever argmax
+    happened to land.
+    """
+    VV, AA = np.meshgrid(v_g, a_g, indexing="ij")
+    vf, af = VV.ravel(), AA.ravel()
+
+    w = _window_map(af, vf, a_b, v_lo, v_hi, dv_range, da_range)
+    # A candidate that misses on its own is never commanded, however good its
+    # neighbourhood looks.
+    w = np.where(_scores(af, vf, a_b, v_lo, v_hi), w, -1.0)
+    if not np.any(w >= 0.0):
+        return None
+
+    top = np.flatnonzero(w >= w.max() - 1e-12)
+    k   = int(top[np.argmin(vf[top])])
+    return float(vf[k]), float(af[k]), float(w[k])
 
 
 def _phi_cdf(z: np.ndarray) -> np.ndarray:
@@ -704,45 +799,42 @@ def find_optimal(goal_distance: float,
                  wind: float = 0.0,
                  with_diagnostics: bool = False):
     """
-    Most ROBUST shot for a given distance — the Chebyshev centre of the scoring
-    band in σ-normalised (velocity, angle) space, i.e. the shot that is
-    furthest from missing in any direction.
+    Most robust shot for a given distance, by MAKE-WINDOW FRACTION: the
+    commandable (velocity, angle) whose ±dv_range x ±da_range neighbourhood
+    contains the largest share of shots that still score.
 
-    `dv_range` / `da_range` are the shooter's 1σ repeatability.
+    Two passes, as the original solver ran them — a 0.20 m/s x 0.50° scan of
+    the whole commandable rectangle, then a 0.025 x 0.10 polish inside ±1 m/s
+    and ±2.5° of the coarse winner.  The coarse winner lands exactly on the
+    fine lattice, so the polish can only improve on it.
+
+    `dv_range` / `da_range` are the shooter's repeatability, read here as the
+    half-width of the tolerance box rather than as a 1σ Gaussian — the window
+    fraction weights every point in the box equally.  The Gaussian reading
+    still drives the reported `p_make` and `margin_sigma`.
     """
-    sigma_v = max(float(dv_range), 1e-6)
-    sigma_a = max(float(da_range), 1e-6)
+    dv_range = max(float(dv_range), 1e-6)
+    da_range = max(float(da_range), 1e-6)
 
     sur = get_surrogate(launch_height, goal_height, wind, enable_drag)
     entry_x_min, entry_x_max = _entry_x_bounds(goal_distance, goal_depth)
+    # The band spans the full surrogate so the tolerance box isn't truncated,
+    # but the shot we RETURN has to be commandable.
     a_b, v_lo, v_hi = band(sur, entry_x_min, entry_x_max)
 
-    # The band spans the full surrogate so perturbations aren't truncated, but
-    # the shot we RETURN has to be commandable.
-    feasible = (~np.isnan(v_lo) & ~np.isnan(v_hi) & (v_hi >= v_lo)
-                & (a_b >= A_MIN_CMD) & (a_b <= A_MAX_CMD))
-    if not feasible.any():
+    coarse = _best_window(_uniform(V_MIN_CMD, V_MAX_CMD, 0.20),
+                          _uniform(A_MIN_CMD, A_MAX_CMD, 0.50),
+                          a_b, v_lo, v_hi, dv_range, da_range)
+    if coarse is None:
         return (None, {}) if with_diagnostics else None
+    v_best, a_best, w_best = coarse
 
-    # The Chebyshev centre sits on the band's medial axis, which the midpoint
-    # curve tracks closely — so seed from it, then polish in 2-D.
-    a_seed = a_b[feasible]
-    v_seed = np.clip(0.5 * (v_lo[feasible] + v_hi[feasible]), V_MIN_CMD, V_MAX_CMD)
-    m_seed = _margin_map(a_seed, v_seed, a_b, v_lo, v_hi, sigma_v, sigma_a)
-    k = int(np.argmax(m_seed))
-    v_best, a_best, m_best = float(v_seed[k]), float(a_seed[k]), float(m_seed[k])
-
-    # Local 2-D polish, twice, shrinking the box.
-    span_v, span_a = 0.40, 4.0
-    for _ in range(2):
-        vs = np.clip(np.linspace(v_best - span_v, v_best + span_v, 41), V_MIN_CMD, V_MAX_CMD)
-        as_ = np.clip(np.linspace(a_best - span_a, a_best + span_a, 41), A_MIN_CMD, A_MAX_CMD)
-        VV, AA = np.meshgrid(vs, as_, indexing="ij")
-        mm = _margin_map(AA.ravel(), VV.ravel(), a_b, v_lo, v_hi, sigma_v, sigma_a)
-        q = int(np.argmax(mm))
-        if mm[q] > m_best:
-            m_best = float(mm[q]); v_best = float(VV.ravel()[q]); a_best = float(AA.ravel()[q])
-        span_v *= 0.25; span_a *= 0.25
+    fine = _best_window(
+        _uniform(max(V_MIN_CMD, v_best - 1.0), min(V_MAX_CMD, v_best + 1.0), 0.025),
+        _uniform(max(A_MIN_CMD, a_best - 2.5), min(A_MAX_CMD, a_best + 2.5), 0.10),
+        a_b, v_lo, v_hi, dv_range, da_range)
+    if fine is not None and fine[2] >= w_best - 1e-12:
+        v_best, a_best, w_best = fine
 
     best = ShotParams(
         velocity=v_best, angle_deg=a_best,
@@ -753,9 +845,13 @@ def find_optimal(goal_distance: float,
     if not with_diagnostics:
         return best
 
+    # Reported alongside the window fraction, not used to choose the shot.
     diag = {
-        "margin_sigma": m_best,
-        "p_make":       p_make_gaussian(v_best, a_best, a_b, v_lo, v_hi, sigma_v, sigma_a),
+        "window_pct":   100.0 * w_best,
+        "margin_sigma": float(_margin_map(np.array([a_best]), np.array([v_best]),
+                                          a_b, v_lo, v_hi, dv_range, da_range)[0]),
+        "p_make":       p_make_gaussian(v_best, a_best, a_b, v_lo, v_hi,
+                                        dv_range, da_range),
         "monotone_ok":  sur.monotone,
     }
     diag.update(directional_margins(v_best, a_best, a_b, v_lo, v_hi))
@@ -791,6 +887,10 @@ def make_sweep(p: ShotParams,
     a_b, v_lo, v_hi = band(sur, entry_x_min, entry_x_max)
 
     p_make  = p_make_gaussian(p.velocity, p.angle_deg, a_b, v_lo, v_hi, sigma_v, sigma_a)
+    # The solver's own criterion, reported for THIS shot so the tolerance view
+    # and SOLVE OPTIMAL SHOT are quoting the same number.
+    window  = float(_window_map(np.array([p.angle_deg]), np.array([p.velocity]),
+                                a_b, v_lo, v_hi, sigma_v, sigma_a)[0])
     margins = directional_margins(p.velocity, p.angle_deg, a_b, v_lo, v_hi)
     m_sigma = float(_margin_map(np.array([p.angle_deg]), np.array([p.velocity]),
                                 a_b, v_lo, v_hi, sigma_v, sigma_a)[0])
@@ -846,6 +946,7 @@ def make_sweep(p: ShotParams,
         # count of grid cells.
         "made_pct": 100.0 * p_make,
         "p_make":   p_make,
+        "window_pct": 100.0 * window,
         "margin_sigma": m_sigma,
         "margins":  margins,
         "band": {
@@ -874,9 +975,10 @@ def shot_family(p: ShotParams,
 
     Nothing is searched for here.  `band()` already returns the scoring
     velocity interval [v_lo, v_hi] at every angle, so the family is read off
-    directly; at each commandable angle we keep the velocity furthest from
-    missing.  That is NOT the midpoint — the two edges curve differently — so
-    the interval is sampled and scored in a single `_margin_map` call.
+    directly; at each commandable angle we keep the velocity with the widest
+    make window, scoring the whole interval in one `_window_map` call.  That
+    is the same rule `find_optimal` uses, so the highlighted member of the
+    family is the shot the solver would return, up to the angle quantisation.
 
     Where `make_sweep` asks "how safe is THIS shot", this asks "which shots
     score at all, and which part of that family is safe".
@@ -919,15 +1021,25 @@ def shot_family(p: ShotParams,
 
     n_t  = max(3, int(trials))
     frac = np.linspace(0.0, 1.0, n_t)
-    V_try = lo_f[:, None] + frac[None, :] * (hi_f - lo_f)[:, None]
+    # Trials run over the inset interval; `v_lo`/`v_hi` reported to the UI stay
+    # the true edges, so the displayed window is not quietly shrunk.
+    lo_t, hi_t = _inset(lo_f, hi_f)
+    V_try = lo_t[:, None] + frac[None, :] * (hi_t - lo_t)[:, None]
     A_try = np.repeat(a_f[:, None], n_t, axis=1)
-    m = _margin_map(A_try.ravel(), V_try.ravel(),
+    w = _window_map(A_try.ravel(), V_try.ravel(),
                     a_b, v_lo, v_hi, sigma_v, sigma_a).reshape(V_try.shape)
 
     rows   = np.arange(a_f.size)
-    k      = np.argmax(m, axis=1)
+    # V_try climbs with the trial index, so argmax's first-wins tie-break is
+    # the solver's "slower shot on a tie".
+    k      = np.argmax(w, axis=1)
     v_best = V_try[rows, k]
-    m_best = m[rows, k]
+    w_best = w[rows, k]
+    # Margin is reported next to the window, not used to choose.
+    m_best = _margin_map(a_f, v_best, a_b, v_lo, v_hi, sigma_v, sigma_a)
+
+    top   = np.flatnonzero(w_best >= w_best.max() - 1e-12)
+    i_top = int(top[np.argmin(v_best[top])])
 
     r = _integrate(v_best, a_f, p.launch_height,
                    goal_height=p.goal_height, wind=p.wind, enable_drag=p.enable_drag,
@@ -946,6 +1058,7 @@ def shot_family(p: ShotParams,
             "velocity":   round(float(v_best[i]), 4),
             "v_lo":       round(float(lo_f[i]), 4),
             "v_hi":       round(float(hi_f[i]), 4),
+            "window_pct": round(100.0 * float(w_best[i]), 3),
             "margin_sigma": round(float(m_best[i]), 4),
             "p_make":     p_make_gaussian(float(v_best[i]), float(a_f[i]),
                                           a_b, v_lo, v_hi, sigma_v, sigma_a),
@@ -964,7 +1077,7 @@ def shot_family(p: ShotParams,
         **empty,
         "shots":       shots,
         "count":       len(shots),
-        "best_index":  int(np.argmax(m_best)),
+        "best_index":  i_top,
         "angle_span":  [round(float(a_f[0]), 2), round(float(a_f[-1]), 2)],
     }
 
@@ -1045,9 +1158,10 @@ def sweep_targets(distances,
                   goal_depth:  float = GOAL_DEPTH_M,
                   wind: float = 0.0) -> List[dict]:
     """
-    `find_optimal` once per distance.  The surrogate does not depend on goal
-    distance, so every distance after the first is pure array arithmetic on an
-    already-built cache.
+    `find_optimal` once per distance — so every row is picked by make-window
+    fraction.  The surrogate does not depend on goal distance, so every
+    distance after the first is pure array arithmetic on an already-built
+    cache.
 
     Unreachable distances come back as rows with `ok: False` rather than being
     dropped, so a caller plotting the result can show the gap where it is.
@@ -1068,6 +1182,7 @@ def sweep_targets(distances,
                     "ok":           True,
                     "velocity":     round(best.velocity, 4),
                     "angle_deg":    round(best.angle_deg, 3),
+                    "window_pct":   round(diag["window_pct"], 3),
                     "margin_sigma": round(diag["margin_sigma"], 4),
                     "p_make":       diag["p_make"],
                     "v_down_ms":    diag["v_down_ms"],
@@ -1149,6 +1264,7 @@ if __name__ == "__main__":
     if best:
         rb = simulate(best)
         print(f"\noptimal: v={best.velocity:.2f} m/s  angle={best.angle_deg:.1f}°  made={rb.made}")
-        print(f"         margin={diag['margin_sigma']:.2f}σ  P(make)={diag['p_make']*100:.1f}%")
+        print(f"         window={diag['window_pct']:.1f}%  margin={diag['margin_sigma']:.2f}σ  "
+              f"P(make)={diag['p_make']*100:.1f}%")
         print(f"         slack: -{diag['v_down_ms']:.2f}/+{diag['v_up_ms']:.2f} m/s, "
               f"-{diag['a_down_deg']:.1f}/+{diag['a_up_deg']:.1f}°")

@@ -206,7 +206,7 @@ def test_cross_path():
           f"max|Δx|={worst:.2e} m")
 
 
-# ── 7. Optimiser actually maximises robustness ──────────────────────────────
+# ── 7. Optimiser actually maximises the make window ─────────────────────────
 def test_optimum():
     worse = 0
     for h_in, d_in, drag, wind in CONFIGS[:5]:
@@ -219,18 +219,45 @@ def test_optimum():
         sur = P.get_surrogate(h, wind=wind, enable_drag=drag)
         lo_x, hi_x = P._entry_x_bounds(d, P.GOAL_DEPTH_M)
         a_b, v_lo, v_hi = P.band(sur, lo_x, hi_x)
-        # random probe: nothing should beat the reported margin
+        # random probe: nothing should beat the reported make window.  The
+        # window is itself sampled on a 21x21 box lattice, so it moves in
+        # steps of 100/441 = 0.23 pt; a probe landing between the solver's
+        # own 0.025 m/s x 0.10° lattice points can pick up a couple of those.
+        # Measured worst excess is 0.45 pt over 600k probes, so 1 pt is loose
+        # enough not to flake and far tighter than a genuinely wrong optimum.
         rng = np.random.default_rng(11)
         pv = rng.uniform(P.V_MIN_CMD, P.V_MAX_CMD, 4000)
         pa = rng.uniform(P.A_MIN_CMD, P.A_MAX_CMD, 4000)
-        m = P._margin_map(pa, pv, a_b, v_lo, v_hi, sv, sa)
-        if float(m.max()) > diag["margin_sigma"] + 5e-3:
+        w = P._window_map(pa, pv, a_b, v_lo, v_hi, sv, sa)
+        w = np.where(P._scores(pa, pv, a_b, v_lo, v_hi), w, -1.0)
+        if 100.0 * float(w.max()) > diag["window_pct"] + 1.0:
             worse += 1
         # the returned shot must actually score
         r = P.simulate(best)
         if not r.made:
             worse += 1
     check("optimum is a true maximum and scores", worse == 0, f"{worse} violations")
+
+    # The window rule is not the margin rule: it counts area inside the box,
+    # so it can prefer an off-centre shot in a fat band.  Pin the distinction
+    # rather than let a silent revert to `_margin_map` pass unnoticed.
+    h, d = P.in_to_m(15.75), P.in_to_m(60)
+    sur = P.get_surrogate(h)
+    lo_x, hi_x = P._entry_x_bounds(d, P.GOAL_DEPTH_M)
+    a_b, v_lo, v_hi = P.band(sur, lo_x, hi_x)
+    sv, sa = 0.7, 1.5
+    b, dg = P.find_optimal(d, h, dv_range=sv, da_range=sa, with_diagnostics=True)
+    a_g = P._uniform(P.A_MIN_CMD, P.A_MAX_CMD, 0.5)
+    v_g = P._uniform(P.V_MIN_CMD, P.V_MAX_CMD, 0.05)
+    VV, AA = np.meshgrid(v_g, a_g, indexing="ij")
+    m = P._margin_map(AA.ravel(), VV.ravel(), a_b, v_lo, v_hi, sv, sa)
+    w = P._window_map(AA.ravel(), VV.ravel(), a_b, v_lo, v_hi, sv, sa)
+    k = int(np.argmax(m))
+    w_at_margin_opt = 100.0 * float(w[k])
+    check("window optimum beats the margin optimum on window",
+          dg["window_pct"] >= w_at_margin_opt - 1e-6,
+          f"window {dg['window_pct']:.2f}% vs {w_at_margin_opt:.2f}% at the "
+          f"margin optimum (v={VV.ravel()[k]:.2f}, a={AA.ravel()[k]:.1f})")
 
 
 # ── 8. Cache determinism and thread safety ──────────────────────────────────
@@ -300,15 +327,15 @@ def test_family():
         best = fam["shots"][fam["best_index"]]
         _, diag = P.find_optimal(d, h, enable_drag=drag, wind=wind,
                                  dv_range=0.25, da_range=1.0, with_diagnostics=True)
-        worst_best = max(worst_best, diag["margin_sigma"] - best["margin_sigma"])
+        worst_best = max(worst_best, diag["window_pct"] - best["window_pct"])
 
     check("every shot in the family scores", bad_score == 0, f"{bad_score}/{total} miss")
     check("family speed sits inside its own scoring window", bad_window == 0,
           f"{bad_window}/{total} outside")
     check("family entry position inside the opening", bad_entry == 0,
           f"{bad_entry}/{total} outside [0,1]")
-    check("family best matches find_optimal", worst_best < 0.05,
-          f"max Δmargin={worst_best:.4f}σ (1° quantisation)")
+    check("family best matches find_optimal", worst_best < 2.0,
+          f"max Δwindow={worst_best:.3f} pt (1° quantisation)")
 
 
 # ── 10. Monte-Carlo cloud agrees with the analytic probability ──────────────
@@ -365,12 +392,14 @@ def test_target_sweep():
           f"{drops} violations over {len(ok_rows)} reachable distances")
 
     # The scoring band narrows as the shot gets longer, so the best available
-    # margin can only shrink.
+    # make window can only shrink.  `margin_sigma` is NOT the right quantity
+    # here any more — the solver optimises the window, so the margin it
+    # happens to land on wobbles by a few thousandths between distances.
     widened = sum(1 for a, b in zip(ok_rows, ok_rows[1:])
-                  if b["margin_sigma"] > a["margin_sigma"] + 1e-6)
-    check("robustness margin shrinks with distance", widened == 0,
-          f"{widened} increases; {ok_rows[0]['margin_sigma']:.2f}σ → "
-          f"{ok_rows[-1]['margin_sigma']:.2f}σ")
+                  if b["window_pct"] > a["window_pct"] + 1e-6)
+    check("make window shrinks with distance", widened == 0,
+          f"{widened} increases; {ok_rows[0]['window_pct']:.2f}% → "
+          f"{ok_rows[-1]['window_pct']:.2f}%")
 
 
 def bench():

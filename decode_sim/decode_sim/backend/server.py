@@ -101,6 +101,7 @@ def api_optimize():
         "ok":           True,
         "velocity":     best.velocity,
         "angle_deg":    best.angle_deg,
+        "window_pct":   diag["window_pct"],
         "margin_sigma": diag["margin_sigma"],
         "p_make":       diag["p_make"],
         "margins": {
