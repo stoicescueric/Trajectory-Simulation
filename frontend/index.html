@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>DECODE / Shot Trajectory Simulator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="bg-grid"></div>
+
+<header class="top-bar">
+  <div class="brand">
+    <div class="brand-mark">◢◤</div>
+    <div>
+      <div class="brand-title">SHOT TRAJECTORY SIMULATOR</div>
+      <div class="brand-sub">FTC · DECODE 2025–26 · Artifact Launch Analysis</div>
+    </div>
+  </div>
+  <div class="status-pills">
+    <span class="pill pill-live"><span class="dot"></span>LIVE</span>
+    <span class="pill">ρ<sub>air</sub> 1.204 kg/m³</span>
+    <span class="pill">m 74.8 g</span>
+    <span class="pill">⌀ 127 mm</span>
+    <span class="pill">Cd ≈ 0.47</span>
+  </div>
+</header>
+
+<div class="app-body">
+
+  <!-- ══ LEFT SIDEBAR ══ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-inner">
+
+      <section class="card">
+        <div class="card-head">
+          <span class="card-tag">01</span>
+          <span class="card-title">LAUNCH PARAMETERS</span>
+        </div>
+
+        <div class="param-row">
+          <div class="param-label">
+            <span>EXIT VELOCITY</span>
+            <span class="param-val" id="v-display">7.00 <em>m/s</em></span>
+          </div>
+          <input type="range" id="velocity" class="slider" min="2" max="12" step="0.05" value="7.0"/>
+          <div class="param-sub">
+            <span id="v-mph">12.30 mph</span>
+            <span id="v-fps">18.05 ft/s</span>
+          </div>
+        </div>
+
+        <div class="param-row">
+          <div class="param-label">
+            <span>LAUNCH ANGLE</span>
+            <span class="param-val" id="a-display">60.0<em>°</em></span>
+          </div>
+          <input type="range" id="angle" class="slider" min="20" max="80" step="0.5" value="60"/>
+        </div>
+
+        <div class="param-row">
+          <div class="param-label">
+            <span>LAUNCH HEIGHT</span>
+            <span class="param-val" id="h-display">15.75 <em>in</em></span>
+          </div>
+          <input type="range" id="height" class="slider" min="6" max="24" step="0.25" value="15.75"/>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <span class="card-tag">02</span>
+          <span class="card-title">TARGET / FIELD</span>
+        </div>
+
+        <div class="param-row">
+          <div class="param-label">
+            <span>GOAL DISTANCE</span>
+            <span class="param-val" id="d-display">60.0 <em>in</em></span>
+          </div>
+          <input type="range" id="distance" class="slider" min="12" max="144" step="1" value="60"/>
+          <div class="param-sub">
+            <span id="d-tiles">2.5 tiles</span>
+            <span id="d-m">1.524 m</span>
+          </div>
+        </div>
+
+        <div class="param-row">
+          <div class="param-label">
+            <span>WIND ASSIST</span>
+            <span class="param-val" id="w-display">0.0 <em>m/s</em></span>
+          </div>
+          <input type="range" id="wind" class="slider" min="-2" max="2" step="0.1" value="0"/>
+        </div>
+
+        <label class="toggle-row">
+          <input type="checkbox" id="drag" checked/>
+          <span class="toggle-track"></span>
+          <span class="toggle-label">AERO DRAG</span>
+        </label>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <span class="card-tag">03</span>
+          <span class="card-title">TOLERANCE SWEEP</span>
+        </div>
+        <div class="sweep-info">Set bounded velocity and angle half-widths. Robust coverage is the
+          fraction of that perturbation box that still scores; it is not a fitted probability.</div>
+        <div class="sweep-controls">
+          <div class="param-row" style="margin-bottom:0">
+            <div class="param-label"><span>VELOCITY ±</span><span class="param-val" id="dv-display">0.70 <em>m/s</em></span></div>
+            <input type="range" id="sweep-dv" class="slider" min="0.05" max="1.5" step="0.05" value="0.70"/>
+          </div>
+          <div class="param-row" style="margin-bottom:0">
+            <div class="param-label"><span>ANGLE ±</span><span class="param-val" id="da-display">1.5 <em>°</em></span></div>
+            <input type="range" id="sweep-da" class="slider" min="0.1" max="5" step="0.1" value="1.5"/>
+          </div>
+          <div class="param-row" style="margin-bottom:0">
+            <div class="param-label"><span>DRAWN CURVES</span>
+              <select id="resolution" class="select-mini">
+                <option value="7">sparse</option>
+                <option value="11" selected>normal</option>
+                <option value="15">dense</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <button id="btn-window" class="btn-secondary">⟳ RUN SWEEP</button>
+        <div class="sweep-stat">
+          ROBUST COVERAGE: <strong id="rd-window">—</strong>
+        </div>
+        <div class="sweep-stat">
+          MARGIN: <strong id="rd-margin">—</strong> <em style="font-style:normal;color:var(--fg-3)">to nearest miss</em>
+        </div>
+        <div class="sweep-stat" id="rd-slack-row">
+          SLACK: <strong id="rd-slack">—</strong>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <span class="card-tag">04</span>
+          <span class="card-title">TOOLS</span>
+        </div>
+        <button id="btn-optimize" class="btn-primary">⟶ SOLVE OPTIMAL SHOT</button>
+        <div id="optimize-out" class="solver-out"></div>
+        <button id="btn-download" class="btn-secondary" style="margin-top:8px">⬇ DOWNLOAD LOOKUP TABLE</button>
+        <div class="dl-info">Exports velocity × angle → made/miss + impact height for robot use.</div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <span class="card-tag">05</span>
+          <span class="card-title">SHOT FAMILY</span>
+        </div>
+        <div class="sweep-info">Every commandable shot that scores at the current distance — one
+          robust representative per launch angle. CLOUD mode samples the declared bounded box to
+          show its simulated make/miss pattern.</div>
+        <button id="btn-family" class="btn-secondary">◠ RUN SHOT FAMILY</button>
+        <div id="family-status" class="status-line" role="status" aria-live="polite"></div>
+        <div id="family-list" class="family-list" aria-label="All scoring shots"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <span class="card-tag">06</span>
+          <span class="card-title">TARGET SWEEP</span>
+        </div>
+        <div class="sweep-info">Solves the most robust shot at every distance in the range —
+          the numbers to bake into a distance-indexed shooter table.</div>
+        <div class="field-group">
+          <label class="field-row" for="ts-from">
+            <span>FROM</span>
+            <span class="field-input-wrap">
+              <input id="ts-from" class="number-input" type="number" min="6" max="240" step="1" value="24" inputmode="decimal"/>
+              <span>in</span>
+            </span>
+          </label>
+          <label class="field-row" for="ts-to">
+            <span>TO</span>
+            <span class="field-input-wrap">
+              <input id="ts-to" class="number-input" type="number" min="6" max="240" step="1" value="144" inputmode="decimal"/>
+              <span>in</span>
+            </span>
+          </label>
+          <label class="field-row" for="ts-step">
+            <span>STEP</span>
+            <span class="field-input-wrap">
+              <input id="ts-step" class="number-input" type="number" min="0.5" max="48" step="0.5" value="4" inputmode="decimal"/>
+              <span>in</span>
+            </span>
+          </label>
+        </div>
+        <button id="btn-targets" class="btn-secondary" style="margin-top:9px">⇉ RUN TARGET SWEEP</button>
+        <div class="progress"><div class="progress-fill" id="ts-fill"></div></div>
+        <div id="ts-status" class="status-line" role="status" aria-live="polite"></div>
+        <button id="btn-targets-csv" class="btn-secondary" style="margin-top:8px" disabled>⬇ DOWNLOAD SWEEP CSV</button>
+      </section>
+
+    </div>
+  </aside>
+
+  <!-- ══ MAIN CONTENT ══ -->
+  <main class="main-content">
+
+    <!-- readout strip always visible -->
+    <div class="readout-strip">
+      <div class="readout"><span class="rd-label">APEX</span><span class="rd-val" id="rd-apex">—</span></div>
+      <div class="readout"><span class="rd-label">FLIGHT TIME</span><span class="rd-val" id="rd-time">—</span></div>
+      <div class="readout"><span class="rd-label">Y @ GOAL</span><span class="rd-val" id="rd-impact">—</span></div>
+      <div class="readout"><span class="rd-label">ENTRY ANGLE</span><span class="rd-val" id="rd-entry">—</span></div>
+      <div class="readout result" id="result-readout"><span class="rd-label">RESULT</span><span class="rd-val" id="rd-made">PENDING</span></div>
+    </div>
+
+    <!-- view tabs -->
+    <div class="view-tabs">
+      <button class="tab active" data-tab="side">SIDE VIEW (2D)</button>
+      <button class="tab" data-tab="iso">3D VIEW</button>
+      <button class="tab" data-tab="sweep">TOLERANCE SWEEP</button>
+      <button class="tab" data-tab="tolmap">TOLERANCE MAP</button>
+      <button class="tab" data-tab="family">SHOT FAMILY</button>
+      <button class="tab" data-tab="targets">TARGET SWEEP</button>
+    </div>
+
+    <div class="canvas-wrap" id="tab-side">
+      <canvas id="trajectory"></canvas>
+    </div>
+
+    <div class="canvas-wrap hidden" id="tab-iso">
+      <canvas id="traj3d"></canvas>
+      <div class="view3d-controls">
+        <label>AZIMUTH <input type="range" id="az" min="-180" max="180" step="1" value="-30" class="slider slider-sm"/></label>
+        <label>ELEVATION <input type="range" id="el" min="5" max="85" step="1" value="25" class="slider slider-sm"/></label>
+      </div>
+    </div>
+
+    <div class="canvas-wrap hidden" id="tab-sweep">
+      <canvas id="sweep-canvas"></canvas>
+    </div>
+
+    <div class="canvas-wrap hidden" id="tab-tolmap">
+      <canvas id="tolmap-canvas"></canvas>
+    </div>
+
+    <div class="canvas-wrap hidden" id="tab-family">
+      <canvas id="family-canvas"></canvas>
+      <div class="family-controls">
+        <div class="seg-ctl" id="family-mode" role="group" aria-label="Shot family view mode">
+          <button type="button" class="seg active" data-mode="family" aria-pressed="true">FAMILY</button>
+          <button type="button" class="seg" data-mode="cloud" aria-pressed="false">CLOUD</button>
+        </div>
+        <label>ANGLE STEP
+          <select id="family-step" class="select-mini">
+            <option value="0.5">0.5°</option>
+            <option value="1" selected>1°</option>
+            <option value="2">2°</option>
+          </select>
+        </label>
+        <label class="hidden">SAMPLES
+          <select id="mc-samples" class="select-mini">
+            <option value="100">100</option>
+            <option value="250" selected>250</option>
+            <option value="500">500</option>
+          </select>
+        </label>
+      </div>
+      <div id="family-tip" class="canvas-tip hidden" role="status" aria-live="polite"></div>
+    </div>
+
+    <div class="canvas-wrap hidden" id="tab-targets">
+      <canvas id="targets-canvas"></canvas>
+    </div>
+
+  </main>
+</div>
+
+<footer class="bottom-bar">
+  <span>RK4 · Hermite event location · quadratic drag · gravity 9.807 m/s²</span>
+  <span>Magnus effect disabled — gravity + drag only</span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
