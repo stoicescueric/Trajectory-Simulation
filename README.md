@@ -1,7 +1,7 @@
 # DECODE Shot Simulator
 
 Offline trajectory simulator for **FTC DECODE 2025–26**. Gravity + quadratic aerodynamic drag,
-integrated with RK4 and exact Hermite event location. Built in the spirit of FRC Team
+integrated with RK4 and exact Hermite event location.
 
 ```
 Trajectory-Simulation/
